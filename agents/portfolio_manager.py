@@ -46,6 +46,7 @@ def decide_portfolio(
     positions: list,
     current_prices: dict,
     watchlist: list,
+    trader_persona: str = "",
 ) -> list:
     positions_text = (
         "\n".join(
@@ -72,10 +73,12 @@ Watchlist: {', '.join(watchlist)}
 
 Return a JSON array with one decision object per ticker in the watchlist."""
 
+    effective_system = f"{trader_persona}\n\n{_SYSTEM}" if trader_persona else _SYSTEM
+
     msg = _client.messages.create(
         model="claude-haiku-4-5-20251001",
         max_tokens=1024,
-        system=_SYSTEM,
+        system=effective_system,
         messages=[{"role": "user", "content": user_content}],
     )
     raw = msg.content[0].text.strip()

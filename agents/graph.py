@@ -6,6 +6,7 @@ from utils.db import supabase
 from agents.news_analyst import analyze_news
 from agents.technical_analyst import analyze_technicals
 from agents.portfolio_manager import decide_portfolio
+from agents.trader_config import TraderConfig
 
 
 class HedgeFundState(TypedDict):
@@ -20,6 +21,8 @@ class HedgeFundState(TypedDict):
     tech_signals: Dict             # {rsi: {ticker: float}, macd: {ticker: str}, trend: {ticker: str}, signals: str}
     trade_proposal: List[Dict]     # [{ticker, action, shares, reasoning, confidence}]
     vp_verdict: str                # "execute_trade" or "human_review"
+    vp_threshold: float            # fraction of capital that triggers human review (from TraderConfig)
+    trader_persona: str            # prepended to PM system prompt (from TraderConfig)
     errors: List[str]              # accumulated non-fatal errors from any node
 
 
@@ -50,7 +53,12 @@ def fetch_data(state: HedgeFundState) -> dict:
         .execute()
     )
 
-    positions_rows = supabase.table("portfolio_positions").select("*").execute()
+    positions_rows = (
+        supabase.table("portfolio_positions")
+        .select("*")
+        .eq("trader_id", state["trader_id"])
+        .execute()
+    )
 
     return {
         "watchlist": tickers,
@@ -79,6 +87,7 @@ def news_analyst_node(state: HedgeFundState) -> dict:
         "action": "analyze",
         "reasoning": result["summary"],
         "confidence": None,
+        "trader_id": state["trader_id"],
     }).execute()
 
     return {"news_summary": result, "errors": errors}
@@ -102,6 +111,7 @@ def technical_analyst_node(state: HedgeFundState) -> dict:
         "action": "analyze",
         "reasoning": result["signals"],
         "confidence": None,
+        "trader_id": state["trader_id"],
     }).execute()
 
     return {"tech_signals": result, "errors": errors}
@@ -119,6 +129,7 @@ def portfolio_manager_node(state: HedgeFundState) -> dict:
             positions=state["positions"],
             current_prices=state["current_prices"],
             watchlist=state["watchlist"],
+            trader_persona=state.get("trader_persona", ""),
         )
     except Exception as e:
         errors.append(f"portfolio_manager failed: {e}")
@@ -143,6 +154,7 @@ def portfolio_manager_node(state: HedgeFundState) -> dict:
         "action": "portfolio_review",
         "reasoning": json.dumps(valid),
         "confidence": None,
+        "trader_id": state["trader_id"],
     }).execute()
 
     return {"trade_proposal": valid, "errors": errors}
@@ -158,15 +170,19 @@ def vp_check_node(state: HedgeFundState) -> dict:
     balance_rows = (
         supabase.table("fund_balance")
         .select("cash")
+        .eq("trader_id", state["trader_id"])
         .limit(1)
         .execute()
     )
     if not balance_rows.data:
-        errors.append("vp_check: fund_balance table is empty, routing to human_review")
-        return {"vp_verdict": "human_review", "errors": errors}
+        errors.append(
+            f"vp_check: no fund_balance row for trader_id={state['trader_id']!r}, defaulting to $33,333"
+        )
+        capital = 33_333.0
+    else:
+        capital = float(balance_rows.data[0]["cash"])
 
-    capital = float(balance_rows.data[0]["cash"])
-    threshold = capital * 0.5
+    threshold = capital * state["vp_threshold"]
 
     for trade in state["trade_proposal"]:
         price = state["current_prices"].get(trade["ticker"], 0.0)
@@ -187,6 +203,7 @@ def route_after_vp(state: HedgeFundState) -> str:
 
 def execute_trade_node(state: HedgeFundState) -> dict:
     errors = list(state.get("errors", []))
+    trader_id = state["trader_id"]
     positions_by_ticker = {p["ticker"]: p for p in state.get("positions", [])}
     now = datetime.now(timezone.utc).isoformat()
 
@@ -212,6 +229,7 @@ def execute_trade_node(state: HedgeFundState) -> dict:
             "price": price,
             "total_value": total_value,
             "executed_at": now,
+            "trader_id": trader_id,
         }).execute()
 
         existing = positions_by_ticker.get(ticker)
@@ -225,16 +243,16 @@ def execute_trade_node(state: HedgeFundState) -> dict:
                     "shares": new_shares,
                     "avg_cost": new_avg_cost,
                     "last_updated": now,
-                }).eq("ticker", ticker).execute()
+                }).eq("ticker", ticker).eq("trader_id", trader_id).execute()
             elif action == "SELL":
                 new_shares = existing["shares"] - shares
                 if new_shares <= 0:
-                    supabase.table("portfolio_positions").delete().eq("ticker", ticker).execute()
+                    supabase.table("portfolio_positions").delete().eq("ticker", ticker).eq("trader_id", trader_id).execute()
                 else:
                     supabase.table("portfolio_positions").update({
                         "shares": new_shares,
                         "last_updated": now,
-                    }).eq("ticker", ticker).execute()
+                    }).eq("ticker", ticker).eq("trader_id", trader_id).execute()
         else:
             if action == "BUY":
                 supabase.table("portfolio_positions").insert({
@@ -242,6 +260,7 @@ def execute_trade_node(state: HedgeFundState) -> dict:
                     "shares": shares,
                     "avg_cost": price,
                     "last_updated": now,
+                    "trader_id": trader_id,
                 }).execute()
 
     return {"errors": errors}
@@ -265,9 +284,75 @@ def human_review_node(state: HedgeFundState) -> dict:
             "price_at_decision": price,
             "reasoning": trade.get("reasoning", "")[:500],
             "status": "pending",
+            "trader_id": state["trader_id"],
         }).execute()
 
     return {"errors": errors}
+
+
+def run_all_traders() -> None:
+    from agents.trader_config import TRADERS
+    from datetime import datetime
+
+    print(f"\n{'='*60}")
+    print(f"HEDGE FUND SIM — Multi-Trader Run")
+    print(f"Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"{'='*60}\n")
+
+    summary = []
+
+    for config in TRADERS:
+        print(f"--- {config.name} ({config.trader_id}) ---")
+        try:
+            result = run_graph(config)
+            non_hold = [t for t in result["trade_proposal"] if t["action"] != "HOLD"]
+            status = "OK"
+            detail = (
+                f"verdict={result['vp_verdict']}  "
+                f"trades={len(result['trade_proposal'])}  "
+                f"non-hold={len(non_hold)}  "
+                f"errors={len(result['errors'])}"
+            )
+            if result["errors"]:
+                print(f"  Errors: {result['errors']}")
+        except Exception as exc:
+            status = "FAILED"
+            detail = str(exc)
+            print(f"  EXCEPTION: {exc}")
+
+        print(f"  {detail}\n")
+        summary.append((config.name, status, detail))
+
+    print(f"{'='*60}")
+    print(f"SUMMARY")
+    print(f"{'='*60}")
+    for name, status, detail in summary:
+        print(f"  {name:8s}  [{status}]  {detail}")
+    print(f"{'='*60}\n")
+
+
+def run_graph(config: TraderConfig) -> dict:
+    persona = (
+        f"You are trading on behalf of {config.name}, a {config.personality}. "
+        f"Your risk tolerance is {config.risk_tolerance}."
+    )
+    initial_state: HedgeFundState = {
+        "ticker": "",
+        "trader_id": config.trader_id,
+        "vp_threshold": config.vp_threshold,
+        "trader_persona": persona,
+        "watchlist": [],
+        "prices": [],
+        "current_prices": {},
+        "news_items": [],
+        "positions": [],
+        "news_summary": {},
+        "tech_signals": {},
+        "trade_proposal": [],
+        "vp_verdict": "",
+        "errors": [],
+    }
+    return graph.invoke(initial_state)
 
 
 _builder = StateGraph(HedgeFundState)
@@ -297,3 +382,7 @@ _builder.add_edge("execute_trade_node", END)
 _builder.add_edge("human_review_node", END)
 
 graph = _builder.compile()
+
+
+if __name__ == "__main__":
+    run_all_traders()

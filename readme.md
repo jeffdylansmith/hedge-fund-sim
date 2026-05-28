@@ -1,213 +1,290 @@
-# Hedge Fund Sim — Decisions & Concepts Log
+# Hedge Fund Sim
 
-> Running log of architectural decisions, why we made them, and what the concepts actually mean in plain language. Update this as the project evolves.
+A multi-agent AI system that simulates a hedge fund with three competing traders, real market data, and a full audit trail of every decision. Built to explore multi-agent orchestration, structured LLM output, and human-in-the-loop approval patterns.
 
----
-
-## How to use this file
-
-Each entry has three parts: **what we did**, **why we did it** (the trade-off), and **how to explain it** (plain language for interviews). Add a new entry every time you make a non-obvious technical choice.
+**Live demo:** _coming soon_  
+**Stack:** Python 3.11 · LangGraph · Anthropic Claude · FastAPI · Supabase · Railway
 
 ---
 
-## Architecture decisions
+## What it does
+
+Three AI traders — Alex, Jordan, and Casey — each manage a $33,333 portfolio with distinct investment personalities. Every market session, each trader runs an independent analysis pipeline: news sentiment is evaluated, technical indicators are computed, and a trade proposal is generated. Proposals above a risk threshold are flagged for human review before execution. Every decision, reasoning chain, and outcome is stored for audit and analysis.
+
+The system is designed to be observable — not just a black box that buys and sells, but a pipeline where every step can be inspected, replayed, and explained.
 
 ---
 
-### 1. Started with CrewAI, migrated to LangGraph
-**Date:** Project start → Migration
+## The traders
 
-**What:** Initially built the agent pipeline using CrewAI, then rewrote it in LangGraph.
-
-**Why CrewAI first:** Good ergonomics for getting something running fast. You define agents with roles and backstories, wire them into a crew, and it handles the orchestration. Low boilerplate, good for prototyping.
-
-**Why we migrated:** Three reasons hit us at the same time:
-1. The Portfolio Manager was ignoring JSON formatting instructions — agents in CrewAI communicate via free text strings, so output validation lives inside the LLM's response rather than in your code. Fragile.
-2. The VP circuit-breaker we were planning needed a real if/then routing decision in the middle of the pipeline. CrewAI's sequential/hierarchical process is opinionated and fights you on conditional routing.
-3. Long-term goal of swapping in open-source models on specific nodes — easier to do when each node is a plain function with typed inputs/outputs.
-
-**The trade-off:** LangGraph is more code. You define every node and every edge explicitly. CrewAI would have been fine if the system stayed simple. We outgrew it fast.
-
-**How to explain it in an interview:**
-> "I started with CrewAI because it let me get something working quickly, but I ran into a reliability problem — the agents were passing free text between each other and the one making trade decisions kept formatting its output inconsistently. When I started building the circuit-breaker logic that needed to route differently based on trade size, I realized CrewAI's sequential process couldn't express that cleanly. I migrated to LangGraph, which is more like building a normal data pipeline — you define a shared data object, a series of functions, and explicit routing between them. The AI calls are just one step in a function, not the thing orchestrating everything."
-
----
-
-### 2. LangGraph state as a typed DTO
-**Date:** Migration
-
-**What:** Defined `HedgeFundState` as a `TypedDict` — a Python typed dictionary that flows through every node in the graph.
-
-**Why:** Every node reads from state and writes back to state. No agent queries the database directly (except `fetch_data`). No agent receives unstructured input. If a node expects `state["news_summary"]` to be a dict with keys `summary` and `sentiment`, and it isn't, the error is caught immediately in that node.
-
-**The .NET analogy:** It's a strongly-typed DTO (Data Transfer Object) passed through a service pipeline. Every method in the pipeline knows exactly what it's receiving. Same concept, different syntax.
-
-**Fields:**
-```
-ticker: str                  # which stock this run is analyzing
-trader_id: str               # "alex" | "jordan" | "casey"
-watchlist: list[dict]        # from Supabase watchlist table
-prices: list[dict]           # from Supabase prices table (48 rows per ticker)
-news_items: list[dict]       # from Supabase news_items table (20 rows)
-positions: list[dict]        # current portfolio positions, filtered by trader_id
-current_prices: dict         # {ticker: price} for PM context
-news_summary: dict           # {summary: str, sentiment: bullish|bearish|neutral}
-tech_signals: dict           # {rsi: float|null, macd: float, trend: str, signals: str}
-trade_proposal: dict         # {ticker, action, shares, reasoning, confidence}
-vp_verdict: str              # "execute_trade" | "human_review"
-errors: list[str]            # any node can append here — graph continues on error
-```
-
-**How to explain it:**
-> "LangGraph passes a single typed state object through every node. It's like a DTO in a service pipeline — every function knows exactly what it's receiving and what it's expected to return. This is what fixed the structured output problem: instead of asking the LLM to please format its response as JSON, my code receives whatever the LLM returns, parses and validates it, and decides what to do if it fails. The validation logic lives in my code, not inside the model's output."
-
----
-
-### 3. Supabase writes belong in node wrappers, not agent functions
-**Date:** Migration
-
-**What:** The agent functions (news_analyst, technical_analyst, portfolio_manager) are pure functions — they take data in, call Claude, return structured output. All database writes happen in the node wrapper inside `graph.py`.
-
-**Why:** Separation of concerns. An agent function that both calls an LLM and writes to a database is doing two things, which makes it hard to test and hard to reason about. If a Supabase write fails, you don't want it mixed up with an LLM failure. The node wrapper handles the side effect (DB write) after the pure function succeeds.
-
-**The pattern:**
-```
-graph.py node wrapper:
-  1. pull relevant slice from state
-  2. call agent function (pure, no DB)
-  3. validate output
-  4. write to agent_decisions in Supabase
-  5. return state update
-```
-
-**How to explain it:**
-> "I separated the LLM calls from the database writes. Each agent function is pure — it takes structured input and returns structured output. The node wrapper in the graph handles the side effects. This made each piece independently testable and kept the failure modes clean."
-
----
-
-### 4. JSON output retry loop instead of formatter fallback
-**Date:** Migration
-
-**What:** Replaced the `force_json_from_reasoning()` formatter fallback in `trade_executor.py` with a retry loop inside the Portfolio Manager node.
-
-**Why the old way was fragile:** The formatter tried to scrape JSON out of whatever the model returned using string matching. One unexpected output format and it either silently produced garbage or crashed.
-
-**How the retry loop works:**
-1. Call Claude with a strict system prompt: "Return only a JSON object. No preamble. No markdown."
-2. Try to parse the response as JSON.
-3. If parsing fails, strip markdown fences (```json ... ```) and try again.
-4. If it fails a second time, append to `state["errors"]` and set `trade_proposal` to empty dict.
-5. Downstream nodes check for empty dict and handle gracefully.
-
-**Why this is better:** The validation logic is explicit and in your code. Max 2 attempts. Failure is visible in the errors field, not silent.
-
-**How to explain it:**
-> "LLMs are text generators — sometimes they add 'Sure! Here's the JSON:' before the actual JSON, which breaks your parser. The old approach tried to scrape the JSON out of whatever came back, which was fragile. I replaced it with a retry loop: parse the response, if it fails strip markdown fences and try once more, if it fails again log the error and move on. The system degrades gracefully instead of crashing."
-
----
-
-### 5. VP circuit-breaker as a conditional edge
-**Date:** Migration / multi-trader refactor
-
-**What:** After the Portfolio Manager proposes a trade, a `vp_check_node` computes the notional value and compares it against a threshold (50% of trader capital by default, 30% for Jordan). A `route_after_vp` function returns either `"execute_trade"` or `"human_review"` — this is a LangGraph conditional edge.
-
-**Why not in CrewAI:** CrewAI's sequential process would have required a hacky workaround to branch after a specific agent. In LangGraph, conditional routing is a first-class concept — you register a function that returns the name of the next node, and the graph follows it.
-
-**The .NET analogy:** It's a strategy pattern or a middleware short-circuit — the request gets inspected and routed before it reaches the final handler.
-
-**How to explain it:**
-> "After the portfolio manager proposes a trade, a VP check node looks at the notional value relative to the trader's capital. If it's above the threshold, it routes to a human review queue instead of executing. This is expressed as a conditional edge in LangGraph — a function that returns which node to visit next based on the current state. It's the equivalent of a middleware short-circuit in a web API pipeline."
-
----
-
-### 6. Multi-trader structure via TraderConfig
-**Date:** Multi-trader refactor
-
-**What:** Alex, Jordan, and Casey are not three separate codebases. They're one parameterized graph instantiated with different `TraderConfig` objects.
-
-**What varies per trader:**
-- `personality` string injected into the PM system prompt → changes how Claude reasons
-- `risk_tolerance` → PM is aware of it when sizing positions
-- `vp_threshold` → Jordan's is tighter (0.3) than Alex and Casey (0.5)
-- `trader_id` → scopes all Supabase reads and writes
-
-**What stays identical:** Graph topology, node logic, Anthropic API calls.
-
-**Why this matters architecturally:** Adding a fourth trader is adding one `TraderConfig` instance and one `fund_balance` row. Nothing else changes.
-
-**How to explain it:**
-> "The three traders share the same graph. What differs is a config object injected at runtime — a few sentences of personality description that go into the Portfolio Manager's system prompt, a risk tolerance parameter, and a VP threshold. The same LLM running the same graph produces genuinely different trade decisions because the prompt context is different. Adding a new trader is adding a config object."
-
----
-
-## Concepts glossary
-
-### Agent
-A named LLM call with a specific role and context. In this system: News Analyst, Technical Analyst, Portfolio Manager. Not magic — just a function that calls Claude with a carefully written system prompt.
-
-### Node (LangGraph)
-A Python function that accepts the full state dict, does some work, and returns a partial dict of keys to update. LangGraph merges the return value into the running state — only the keys you return get updated, everything else stays as-is.
-
-### Edge (LangGraph)
-A connection between two nodes that tells the graph which node to visit next. A **conditional edge** is one where a function decides the destination based on current state, rather than always going to the same place.
-
-### State (LangGraph)
-The shared typed dictionary that flows through every node. Think of it as the single source of truth for a graph run — every node reads from it and writes back to it.
-
-### Structured output
-Getting an LLM to return data in a specific format (usually JSON) rather than free text. The challenge is that LLMs are text generators — they can always add unexpected text around the format you want. The solution is validation and retry logic in your code, not relying on the model to be perfectly consistent.
-
-### Conditional routing
-A branching decision in the graph based on current state. In this system: after the VP check, route to execute or human review based on trade size. Equivalent to an if/then in a normal pipeline.
-
-### System prompt
-The instructions you give Claude before the user message. In this system, the system prompt is where trader personality, output format requirements, and context about available data live. It's the most important lever for controlling model behavior.
-
-### RSI (Relative Strength Index)
-A momentum indicator that measures whether a stock is overbought or oversold. Ranges 0–100. Above 70 = potentially overbought (price may pull back). Below 30 = potentially oversold (price may recover). Requires 14 data points to compute — with fewer rows, returns null rather than an unreliable value.
-
-### MACD (Moving Average Convergence Divergence)
-A trend-following indicator that shows the relationship between two moving averages of price. When MACD crosses above its signal line, it's considered a bullish signal. When it crosses below, bearish. Good for identifying momentum shifts.
-
-### Sharpe Ratio
-Risk-adjusted return. Measures how much return you're getting per unit of risk (volatility). A Sharpe above 1.0 is generally considered good. Lets you compare traders fairly — a trader with 20% returns and low volatility beats one with 25% returns and wild swings.
-
-### Lookahead bias
-A backtesting mistake where your model accidentally uses future data when making historical predictions — for example, using the closing price of the day you're predicting to compute an indicator. Makes backtest results look much better than reality.
-
-### Survivorship bias
-A backtesting mistake where you only test on stocks that still exist today, ignoring companies that went bankrupt or were delisted. Inflates apparent returns because you've removed all the losers from the dataset.
-
----
-
-## Schema reference
-
-### Supabase tables
-| Table | Purpose | Key columns |
-|---|---|---|
-| `watchlist` | Tickers the system tracks | `ticker`, `name` |
-| `prices` | Historical OHLCV data | `ticker`, `close`, `timestamp` |
-| `news_items` | Raw news articles | `ticker`, `headline`, `sentiment`, `published_at` |
-| `agent_decisions` | Audit trail of every LLM decision | `agent_name`, `ticker`, `action`, `reasoning`, `confidence`, `trader_id` |
-| `portfolio_positions` | Current holdings per trader | `ticker`, `shares`, `avg_cost`, `trader_id` |
-| `trades` | Executed trades | `ticker`, `action`, `shares`, `price`, `executed_at`, `trader_id` |
-| `pending_decisions` | Trades awaiting human approval | `ticker`, `action`, `shares`, `price`, `status`, `trader_id` |
-| `fund_balance` | Capital per trader | `trader_id`, `cash`, `last_updated` |
-
-### Known issues / tech debt
-- `datetime.now()` was used in places that should be `datetime.now(timezone.utc).isoformat()` — fixed in graph.py, watch for recurrence
-- `fund_balance` currently has no `trader_id` column — using single row for now, `trader_id` field in state kept for forward compatibility
-- `pending_decisions` rows 1–5 have null shares from before JSON formatter — delete them when convenient
-
----
-
-## Framework comparison
-
-| | CrewAI | LangGraph | Raw Anthropic API |
+| Trader | Style | Risk tolerance | VP threshold |
 |---|---|---|---|
-| Best for | Rapid prototyping | Production pipelines with conditional routing | Simple single-agent calls |
-| Control flow | Sequential or hierarchical (opinionated) | Explicit nodes and edges (you define everything) | N/A — just a function call |
-| Structured output | Agent can ignore instructions | Node validates return value | You validate return value |
-| Model swapping | Harder — abstracted away | Easy — each node is a plain function | Trivial |
-| Industry use | Prototypes, demos | Production systems | Always used alongside a framework |
-| When we use it | Archived | All agent orchestration | VP check, formatter retry |
+| **Alex** | Aggressive momentum — acts quickly on price signals, comfortable with concentration | High | 50% of capital |
+| **Jordan** | Conservative macro — prioritizes capital preservation, requires strong conviction | Low | 30% of capital |
+| **Casey** | Contrarian — fades crowded trades, looks for overcrowded positions to short | Medium | 50% of capital |
+
+Each trader runs the same analysis pipeline with different personality context injected into the Portfolio Manager's prompt. The same market data produces genuinely different trade proposals because the reasoning context differs.
+
+---
+
+## System architecture
+
+```
+Market Data (yfinance)  ──┐
+                           ├──▶  Supabase Postgres  ──▶  LangGraph Pipeline
+News Data (NewsAPI)     ──┘                                      │
+                                                                  ▼
+                                                    ┌─────────────────────────┐
+                                                    │      fetch_data         │
+                                                    │  reads prices, news,    │
+                                                    │  positions from DB      │
+                                                    └────────────┬────────────┘
+                                                                 │
+                                              ┌──────────────────┴──────────────────┐
+                                              ▼                                     ▼
+                                   ┌──────────────────┐                  ┌──────────────────┐
+                                   │   news_analyst   │                  │  tech_analyst    │
+                                   │ sentiment + JSON │                  │ RSI, MACD, trend │
+                                   └────────┬─────────┘                  └────────┬─────────┘
+                                            │                                     │
+                                            └──────────────┬──────────────────────┘
+                                                           ▼
+                                                ┌──────────────────┐
+                                                │ portfolio_manager│
+                                                │ trade proposal   │
+                                                │ + retry loop     │
+                                                └────────┬─────────┘
+                                                         │
+                                                         ▼
+                                                ┌──────────────────┐
+                                                │    vp_check      │
+                                                │ notional vs cap  │
+                                                └────────┬─────────┘
+                                                         │
+                                          ┌──────────────┴──────────────┐
+                                          ▼                             ▼
+                                 ┌────────────────┐          ┌──────────────────┐
+                                 │ execute_trade  │          │  human_review    │
+                                 │ writes trades  │          │ pending_decisions│
+                                 │ + positions    │          │ awaits approval  │
+                                 └────────────────┘          └──────────────────┘
+```
+
+Each trader runs this pipeline independently. All nodes share a typed state object (`HedgeFundState`) — no agent queries the database directly except `fetch_data`.
+
+---
+
+## Agent pipeline
+
+### How agents work
+
+Each "agent" is a direct call to the Anthropic Claude API (claude-haiku-4-5) with a carefully constructed system prompt. There is no agent magic — an agent is a function that takes structured input, calls Claude, validates the output, and returns structured data. The orchestration between agents is handled by LangGraph, not by the agents themselves.
+
+This is an important distinction: the LLM handles *reasoning*, while the application code handles *routing, validation, and side effects*.
+
+### Node 1 — `fetch_data`
+Reads from Supabase: the watchlist, 48 price rows per ticker, 20 recent news items, current portfolio positions (scoped by `trader_id`), and current prices. Populates the shared state object. This is the only node that reads raw market data — all downstream nodes receive data through state.
+
+### Node 2 — `news_analyst`
+Receives `state["news_items"]`. Calls Claude with a system prompt instructing it to return a JSON object with two keys: `summary` (a concise narrative of the news landscape) and `sentiment` (one of: `bullish`, `bearish`, `neutral`). The node validates both keys are present before writing to state. On failure, appends to `state["errors"]` and sets `news_summary` to an empty dict so downstream nodes can handle it gracefully.
+
+Output shape:
+```json
+{
+  "summary": "TSLA reported stronger than expected delivery numbers...",
+  "sentiment": "bullish"
+}
+```
+
+### Node 3 — `technical_analyst`
+Receives `state["prices"]`. Uses pandas to compute RSI(14), MACD, and trend direction for each ticker. RSI returns `null` when fewer than 14 price rows exist — the system is honest about insufficient data rather than extrapolating. Returns a structured dict of signals per ticker.
+
+Output shape:
+```json
+{
+  "TSLA": {
+    "rsi": 62.4,
+    "macd": 3.21,
+    "trend": "uptrend",
+    "signals": "Momentum positive, RSI approaching overbought"
+  }
+}
+```
+
+### Node 4 — `portfolio_manager`
+Receives `state["news_summary"]`, `state["tech_signals"]`, `state["positions"]`, and `state["current_prices"]`. The system prompt includes the trader's personality and risk tolerance, injected from `TraderConfig`. Claude is instructed to return only a JSON object with no preamble or markdown.
+
+A retry loop handles output validation: if JSON parsing fails, markdown fences are stripped and parsing is attempted once more. If both attempts fail, the error is logged and the proposal is set to an empty dict. This replaces an earlier formatter fallback that used string scraping — validation logic now lives in application code, not in the LLM's output.
+
+Output shape:
+```json
+{
+  "ticker": "TSLA",
+  "action": "BUY",
+  "shares": 10,
+  "reasoning": "Positive sentiment combined with upward momentum and RSI below overbought...",
+  "confidence": 0.74
+}
+```
+
+### Node 5 — `vp_check`
+Computes the notional value of the proposed trade (`shares × current_price`) and compares it against `trader.vp_threshold × trader_capital`. Sets `state["vp_verdict"]` to either `"execute_trade"` or `"human_review"`. If `trade_proposal` is empty (upstream failure), defaults to `"human_review"`.
+
+### Node 6a — `execute_trade`
+Writes to the `trades` table and upserts `portfolio_positions` with the new share count and updated average cost. All writes are scoped by `trader_id`.
+
+### Node 6b — `human_review`
+Writes to `pending_decisions` with `status = "pending"`. A human operator reviews via the FastAPI backend and approves or rejects. Approval triggers the same writes as `execute_trade`. This node fires for trades above the VP threshold and for any run where upstream nodes encountered errors.
+
+---
+
+## Structured output and reliability
+
+Getting LLMs to return consistent JSON is a non-trivial engineering problem. LLMs are text generators — they can always prepend "Sure! Here's the JSON:" or wrap output in markdown code fences, breaking downstream parsers.
+
+This system handles it in three layers:
+
+1. **Strict system prompts** — every agent prompt ends with an explicit instruction: "Return only a JSON object. No preamble. No markdown fences. No explanation after the JSON."
+2. **Retry loop** — if JSON parsing fails, strip fences and retry once. Max 2 attempts.
+3. **Graceful degradation** — if both attempts fail, log to `state["errors"]` and set the output field to an empty dict. Downstream nodes check for empty dict and route to human review rather than crashing.
+
+---
+
+## Why LangGraph
+
+The system was originally built with CrewAI, a higher-level agent framework. CrewAI was migrated away from for three reasons:
+
+**Control flow.** CrewAI's process is sequential or hierarchical — opinionated about how agents connect. The VP circuit-breaker requires a conditional routing decision in the middle of the pipeline (execute vs. human review based on trade size). LangGraph expresses this as a first-class concept: a function that returns the name of the next node based on current state.
+
+**Typed state.** In CrewAI, agents communicated via free text strings passed through a crew context. In LangGraph, a single typed `HedgeFundState` dict flows through every node. Each node reads only the fields it needs and writes back only the fields it updates. LangGraph merges return values into the running state — output validation lives in application code.
+
+**Model swappability.** Each LangGraph node is a plain Python function. Swapping Claude for a local open-source model on a specific node is a one-line change. This matters for the long-term goal of fine-tuning a model on the system's own decision data.
+
+---
+
+## Data layer
+
+### Supabase Postgres
+
+All persistent state lives in Supabase. Tables:
+
+| Table | Purpose |
+|---|---|
+| `watchlist` | Tickers the system monitors |
+| `prices` | OHLCV price history (48 rows per ticker, updated on each ingestion run) |
+| `news_items` | Raw news articles with headline, source, and published timestamp |
+| `agent_decisions` | Full audit trail — every LLM decision with reasoning, confidence, and trader_id |
+| `portfolio_positions` | Current holdings per trader. Unique constraint on `(trader_id, ticker)` |
+| `trades` | Executed trades with price, shares, timestamp, and trader_id |
+| `pending_decisions` | Trades awaiting human approval |
+| `fund_balance` | Current cash balance per trader |
+
+### Data ingestion
+
+- **`ingestion/fetch_prices.py`** — pulls OHLCV data via yfinance for all tickers in the watchlist, upserts to `prices`
+- **`ingestion/fetch_news.py`** — pulls recent articles via NewsAPI for each ticker, inserts new items to `news_items`
+
+Ingestion runs are independent of the agent pipeline and are designed to be scheduled separately.
+
+---
+
+## API
+
+FastAPI backend at `api/main.py`. Key endpoints:
+
+| Method | Endpoint | Purpose |
+|---|---|---|
+| `GET` | `/pending` | List trades awaiting human approval |
+| `POST` | `/approve/{decision_id}` | Approve a pending trade — executes immediately |
+| `POST` | `/reject/{decision_id}` | Reject a pending trade |
+| `GET` | `/positions` | Current portfolio positions per trader |
+| `GET` | `/decisions` | Recent agent decisions with reasoning |
+
+Human approval is intentional — trades above the VP threshold require a human to review the agent's reasoning before execution. This is a design choice, not a limitation.
+
+---
+
+## External services
+
+| Service | Purpose | Notes |
+|---|---|---|
+| **Anthropic API** | Powers all three analyst agents and the portfolio manager | Using `claude-haiku-4-5-20251001` — fast and cost-effective for structured output tasks |
+| **yfinance** | Historical and current price data | Free, no API key required |
+| **NewsAPI** | News articles by ticker | Free tier: 100 requests/day |
+| **Supabase** | Postgres database + REST API | Free tier sufficient for development |
+| **Railway** | Deployment target for FastAPI backend | Environment variables managed via Railway dashboard |
+
+---
+
+## Project structure
+
+```
+hedge-fund-sim/
+├── agents/
+│   ├── graph.py              # LangGraph graph — nodes, edges, state schema
+│   ├── news_analyst.py       # News sentiment agent (plain function, no framework)
+│   ├── technical_analyst.py  # Technical indicator computation + LLM summary
+│   ├── portfolio_manager.py  # Trade proposal agent with retry loop
+│   ├── trader_config.py      # TraderConfig dataclass + Alex, Jordan, Casey instances
+│   └── _archive/             # CrewAI originals (crew.py, trade_executor.py)
+├── ingestion/
+│   ├── fetch_prices.py       # yfinance → Supabase prices
+│   └── fetch_news.py         # NewsAPI → Supabase news_items
+├── api/
+│   └── main.py               # FastAPI backend
+├── utils/
+│   └── db.py                 # Supabase client
+├── DECISIONS.md              # Architectural decisions log
+└── README.md                 # This file
+```
+
+---
+
+## Running locally
+
+```bash
+# 1. Clone and install dependencies
+git clone https://github.com/dylan/hedge-fund-sim
+cd hedge-fund-sim
+pip install -r requirements.txt
+
+# 2. Set environment variables
+cp .env.example .env
+# Fill in: ANTHROPIC_API_KEY, SUPABASE_URL, SUPABASE_KEY, NEWS_API_KEY
+
+# 3. Required before running any script
+export PYTHONPATH=/Users/dylan/hedge-fund-sim
+
+# 4. Run data ingestion
+python ingestion/fetch_prices.py
+python ingestion/fetch_news.py
+
+# 5. Run the full multi-trader analysis
+python agents/graph.py
+
+# 6. Start the API
+uvicorn api.main:app --reload
+```
+
+---
+
+## Design decisions worth noting
+
+**Human-in-the-loop is intentional.** The VP threshold isn't just a safety mechanism — it's an architectural statement about where human judgment belongs in an automated system. Large position changes get reviewed. Small ones execute automatically. This mirrors how real trading desks operate.
+
+**Audit trail by default.** Every LLM decision is written to `agent_decisions` with the full reasoning chain, confidence score, and trader identity. The system is designed to be explainable after the fact, not just functional in the moment.
+
+**Graceful degradation over crashes.** Every node appends to `state["errors"]` rather than raising exceptions. A failed news fetch doesn't kill a technical analysis that succeeded. A bad LLM output routes to human review rather than executing garbage. The graph completes every run.
+
+**Trader personalities are prompt engineering.** Alex, Jordan, and Casey are not separate codebases — they're one parameterized graph with different system prompt context. Adding a fourth trader is adding a `TraderConfig` instance and a `fund_balance` row. This is intentional: the interesting behavior emerges from prompt design, not from architectural complexity.
+
+---
+
+## Planned
+
+- **Scheduler** — APScheduler running the pipeline 2–3× daily with a DB-based pause switch
+- **Discovery Agent** — scans news for new tickers, validates and adds to watchlist automatically  
+- **Leaderboard + dashboard** — public-facing UI showing trader P&L, decisions feed, and "meet the team" page with each trader's personality and track record
+- **RAG layer** — store agent reasoning as embeddings so agents can reference past decisions when making new ones
+- **Pattern recognition** — Random Forest on price + sentiment features, backtesting with Sharpe ratio
+- **Open-source model experimentation** — fine-tune a smaller model (Mistral 7B / Llama 3) on the system's own `agent_decisions` data, swap it into one trader's node and compare performance against Claude-powered traders
