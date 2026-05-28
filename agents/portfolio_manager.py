@@ -90,22 +90,30 @@ portfolio_manager = Agent(
 portfolio_task = Task(
     description="""
     1. Read the latest reports from the News Analyst and Technical Analyst
-    2. Check current portfolio positions
-    3. For each ticker with a strong signal, check its current price
-    4. Make a decision for each ticker: BUY, SELL, or HOLD
-    5. For BUY decisions, suggest a position size (number of shares)
-       assuming $100,000 starting capital and max 15% in any single position
-    6. Explain your reasoning for each decision
-    7. Flag any risks you are concerned about
+    2. Check current portfolio positions and available cash
+    3. For each ticker in the watchlist make a decision: BUY, SELL, or HOLD
+    4. For BUY orders: max 15% of $100,000 total capital per position
+       meaning max $15,000 per trade. Calculate shares as floor($15000 / price)
+    5. For SELL orders: sell all shares currently held
+    6. Respond ONLY with a JSON array, no other text, no markdown backticks
+
+    Example format:
+    [
+      {
+        "ticker": "AAPL",
+        "action": "BUY",
+        "shares": 48,
+        "reasoning": "Strong momentum, bullish MACD crossover"
+      },
+      {
+        "ticker": "MSFT",
+        "action": "HOLD",
+        "shares": 0,
+        "reasoning": "Neutral signals, waiting for clearer direction"
+      }
+    ]
     """,
-    expected_output="""
-    A portfolio decision report with:
-    - Decision for each ticker (BUY/SELL/HOLD) with reasoning
-    - Suggested position sizes for any BUY orders
-    - Overall portfolio strategy for today
-    - Key risks to monitor
-    - Confidence level (low/medium/high) for the overall strategy
-    """,
+    expected_output="A valid JSON array of decisions for each ticker, nothing else.",
     agent=portfolio_manager
 )
 
