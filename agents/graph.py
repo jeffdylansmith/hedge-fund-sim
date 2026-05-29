@@ -10,7 +10,8 @@ from utils.db import supabase
 from agents.news_analyst import analyze_news
 from agents.technical_analyst import analyze_technicals
 from agents.portfolio_manager import decide_portfolio
-from agents.trader_config import TraderConfig
+from agents.risk_manager import assess_risk
+from agents.trader_config import TraderConfig, get_trader
 
 ALPACA_API_KEY = os.getenv("ALPACA_API_KEY")
 ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY")
@@ -36,6 +37,7 @@ class HedgeFundState(TypedDict):
     trader_persona: str            # prepended to PM system prompt (from TraderConfig)
     news_analyst_persona: str      # prepended to news analyst system prompt (from TraderConfig)
     tech_analyst_persona: str      # prepended to technical analyst system prompt (from TraderConfig)
+    risk_assessment: Dict          # {risk_score: int 1-10, concentration_pct: float, flags: list[str], recommendation: str, rationale: str}
     errors: List[str]              # accumulated non-fatal errors from any node
 
 
@@ -173,6 +175,51 @@ def portfolio_manager_node(state: HedgeFundState) -> dict:
     return {"trade_proposal": valid, "errors": errors}
 
 
+def risk_manager_node(state: HedgeFundState) -> dict:
+    errors = list(state.get("errors", []))
+    try:
+        balance_rows = (
+            supabase.table("fund_balance")
+            .select("cash")
+            .eq("trader_id", state["trader_id"])
+            .limit(1)
+            .execute()
+        )
+        if not balance_rows.data:
+            errors.append(
+                f"risk_manager: no fund_balance row for trader_id={state['trader_id']!r}, defaulting to $33,333"
+            )
+            cash = 333_333.33
+        else:
+            cash = float(balance_rows.data[0]["cash"])
+
+        trader_config = get_trader(state["trader_id"])
+        result = assess_risk(
+            trade_proposal=state["trade_proposal"],
+            positions=state["positions"],
+            cash=cash,
+            news_summary=state["news_summary"],
+            tech_signals=state["tech_signals"],
+            trader_config=trader_config,
+            current_prices=state["current_prices"],
+            persona=state.get("trader_persona", ""),
+        )
+    except Exception as e:
+        errors.append(f"risk_manager failed: {e}")
+        return {"risk_assessment": {}, "errors": errors}
+
+    supabase.table("agent_decisions").insert({
+        "agent_name": "risk_manager",
+        "ticker": None,
+        "action": "risk_assessment",
+        "reasoning": result.get("rationale", ""),
+        "confidence": None,
+        "trader_id": state["trader_id"],
+    }).execute()
+
+    return {"risk_assessment": result, "errors": errors}
+
+
 def vp_check_node(state: HedgeFundState) -> dict:
     errors = list(state.get("errors", []))
 
@@ -191,7 +238,7 @@ def vp_check_node(state: HedgeFundState) -> dict:
         errors.append(
             f"vp_check: no fund_balance row for trader_id={state['trader_id']!r}, defaulting to $33,333"
         )
-        capital = 33_333.0
+        capital = 333_333.33
     else:
         capital = float(balance_rows.data[0]["cash"])
 
@@ -220,6 +267,23 @@ def execute_trade_node(state: HedgeFundState) -> dict:
     positions_by_ticker = {p["ticker"]: p for p in state.get("positions", [])}
     now = datetime.now(timezone.utc).isoformat()
 
+    balance_rows = (
+        supabase.table("fund_balance")
+        .select("cash")
+        .eq("trader_id", trader_id)
+        .limit(1)
+        .execute()
+    )
+    if not balance_rows.data:
+        errors.append(
+            f"execute_trade: no fund_balance row for trader_id={trader_id!r}, defaulting to $33,333"
+        )
+        cash = 333_333.33
+    else:
+        cash = float(balance_rows.data[0]["cash"])
+
+    cash_delta = 0.0
+
     for trade in state.get("trade_proposal", []):
         if trade["action"] == "HOLD":
             continue
@@ -234,6 +298,15 @@ def execute_trade_node(state: HedgeFundState) -> dict:
             continue
 
         total_value = shares * price
+
+        if action == "BUY":
+            available = cash + cash_delta
+            if total_value > available:
+                errors.append(
+                    f"execute_trade: insufficient funds for {ticker} — "
+                    f"need ${total_value:,.2f}, have ${available:,.2f}, skipping"
+                )
+                continue
 
         trade_result = supabase.table("trades").insert({
             "ticker": ticker,
@@ -292,6 +365,16 @@ def execute_trade_node(state: HedgeFundState) -> dict:
                     "last_updated": now,
                     "trader_id": trader_id,
                 }).execute()
+
+        if action == "BUY":
+            cash_delta -= total_value
+        elif action == "SELL":
+            cash_delta += total_value
+
+    if cash_delta != 0.0:
+        supabase.table("fund_balance").update(
+            {"cash": cash + cash_delta}
+        ).eq("trader_id", trader_id).execute()
 
     return {"errors": errors}
 
@@ -382,6 +465,7 @@ def run_graph(config: TraderConfig) -> dict:
         "tech_signals": {},
         "trade_proposal": [],
         "vp_verdict": "",
+        "risk_assessment": {},
         "errors": [],
     }
     return graph.invoke(initial_state)
@@ -393,6 +477,7 @@ _builder.add_node("fetch_data", fetch_data)
 _builder.add_node("news_analyst_node", news_analyst_node)
 _builder.add_node("technical_analyst_node", technical_analyst_node)
 _builder.add_node("portfolio_manager_node", portfolio_manager_node)
+_builder.add_node("risk_manager_node", risk_manager_node)
 _builder.add_node("vp_check_node", vp_check_node)
 _builder.add_node("execute_trade_node", execute_trade_node)
 _builder.add_node("human_review_node", human_review_node)
@@ -401,7 +486,8 @@ _builder.add_edge(START, "fetch_data")
 _builder.add_edge("fetch_data", "news_analyst_node")
 _builder.add_edge("news_analyst_node", "technical_analyst_node")
 _builder.add_edge("technical_analyst_node", "portfolio_manager_node")
-_builder.add_edge("portfolio_manager_node", "vp_check_node")
+_builder.add_edge("portfolio_manager_node", "risk_manager_node")
+_builder.add_edge("risk_manager_node", "vp_check_node")
 _builder.add_conditional_edges(
     "vp_check_node",
     route_after_vp,
