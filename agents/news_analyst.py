@@ -20,9 +20,11 @@ The object must have exactly these two keys:
 """
 
 
-def analyze_news(news_items: list) -> dict:
+def analyze_news(news_items: list, persona: str = "") -> dict:
     if not news_items:
         return {"summary": "No news data available.", "sentiment": "neutral"}
+
+    system = (persona + "\n\n" + _SYSTEM) if persona else _SYSTEM
 
     lines = [
         f"[{item['published_at']}] {item['headline']} (Source: {item['source']})"
@@ -32,7 +34,7 @@ def analyze_news(news_items: list) -> dict:
     message = _client.messages.create(
         model="claude-haiku-4-5-20251001",
         max_tokens=512,
-        system=_SYSTEM,
+        system=system,
         messages=[{"role": "user", "content": "Analyze these market headlines:\n\n" + "\n".join(lines)}],
     )
 

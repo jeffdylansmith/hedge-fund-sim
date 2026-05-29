@@ -65,17 +65,19 @@ MACD Cross: {'Bullish' if latest['macd'] > latest['macd_signal'] else 'Bearish'}
 """
 
 
-def analyze_technicals(prices: list, watchlist: list) -> dict:
+def analyze_technicals(prices: list, watchlist: list, persona: str = "") -> dict:
     prices_by_ticker: dict[str, list] = {}
     for row in prices:
         prices_by_ticker.setdefault(row["ticker"], []).append(row)
+
+    system = (persona + "\n\n" + _SYSTEM) if persona else _SYSTEM
 
     blocks = [_compute_indicators(ticker, prices_by_ticker.get(ticker, [])) for ticker in watchlist]
 
     message = _client.messages.create(
         model="claude-haiku-4-5-20251001",
         max_tokens=1024,
-        system=_SYSTEM,
+        system=system,
         messages=[
             {
                 "role": "user",
