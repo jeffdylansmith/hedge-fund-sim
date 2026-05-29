@@ -134,7 +134,7 @@ def get_traders():
     balances = supabase.table("fund_balance").select("trader_id, cash").execute()
     balance_map = {row["trader_id"]: float(row["cash"]) for row in balances.data}
 
-    positions = supabase.table("portfolio_positions").select("ticker, shares, trader_id").execute()
+    positions = supabase.table("portfolio_positions").select("ticker, shares, avg_cost, trader_id").execute()
     tickers = list({p["ticker"] for p in positions.data})
     current_prices = {}
     for ticker in tickers:
@@ -156,6 +156,16 @@ def get_traders():
         pos_val = sum(p["shares"] * current_prices.get(p["ticker"], 0.0) for p in trader_positions)
         pnl = (cash + pos_val) - STARTING_CASH
 
+        wins = sum(1 for p in trader_positions if current_prices.get(p["ticker"], 0.0) > p["avg_cost"])
+        losses = sum(1 for p in trader_positions if current_prices.get(p["ticker"], 0.0) < p["avg_cost"])
+
+        trade_count_res = (
+            supabase.table("trades")
+            .select("id", count="exact")
+            .eq("trader_id", trader_id)
+            .execute()
+        )
+
         recent_decision = (
             supabase.table("agent_decisions")
             .select("agent_name, ticker, action, reasoning, confidence, created_at")
@@ -173,6 +183,9 @@ def get_traders():
             "total_value": round(cash + pos_val, 2),
             "pnl": round(pnl, 2),
             "pnl_pct": round((pnl / STARTING_CASH) * 100, 2),
+            "wins": wins,
+            "losses": losses,
+            "trade_count": trade_count_res.count or 0,
             "recent_decision": recent_decision.data[0] if recent_decision.data else None,
         })
 
