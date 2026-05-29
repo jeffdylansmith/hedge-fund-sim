@@ -411,6 +411,25 @@ def approve_decision(decision_id: int):
     total_value = shares * price
     now = datetime.now(timezone.utc).isoformat()
 
+    balance_rows = (
+        supabase.table("fund_balance")
+        .select("cash")
+        .eq("trader_id", trader_id)
+        .limit(1)
+        .execute()
+    )
+    if not balance_rows.data:
+        log.warning(f"approve: no fund_balance row for trader_id={trader_id!r}, defaulting to ${STARTING_CASH:,.0f}")
+        cash = STARTING_CASH
+    else:
+        cash = float(balance_rows.data[0]["cash"])
+
+    if action == "BUY" and total_value > cash:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Insufficient funds — need ${total_value:,.2f}, have ${cash:,.2f}",
+        )
+
     supabase.table("trades").insert({
         "ticker": ticker,
         "action": action.lower(),
@@ -456,6 +475,14 @@ def approve_decision(decision_id: int):
             "last_updated": now,
             "trader_id": trader_id,
         }).execute()
+
+    if action == "BUY":
+        new_cash = cash - total_value
+    elif action == "SELL":
+        new_cash = cash + total_value
+    else:
+        new_cash = cash
+    supabase.table("fund_balance").update({"cash": new_cash}).eq("trader_id", trader_id).execute()
 
     supabase.table("pending_decisions").update({
         "status": "approved",
