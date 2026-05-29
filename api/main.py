@@ -166,6 +166,22 @@ def unpause_scheduler():
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.post("/run")
+def run_now():
+    ran_at = datetime.now(timezone.utc).isoformat()
+    log.info("run: manual trigger via POST /run")
+    try:
+        from agents.graph import run_all_traders
+        run_all_traders()
+        _log_run("success")
+        return {"ran_at": ran_at, "status": "ok", "errors": []}
+    except Exception as e:
+        error = str(e)
+        log.error(f"run: failed — {error}")
+        _log_run("error", error[:500])
+        raise HTTPException(status_code=500, detail=error)
+
+
 # ---------------------------------------------------------------------------
 # Alpaca endpoints
 # ---------------------------------------------------------------------------
