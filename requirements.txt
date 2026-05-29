@@ -1,5 +1,7 @@
+alpaca-trade-api==3.3.2
 annotated-doc==0.0.4
 annotated-types==0.7.0
+apscheduler==3.10.4
 anyio==4.13.0
 appnope==0.1.4
 argon2-cffi==25.1.0
