@@ -98,6 +98,21 @@ def run_market_session() -> None:
         _log_run("error", str(e)[:500])
 
 
+def run_discovery_job() -> None:
+    now_et = datetime.now(ET)
+    if now_et.weekday() >= 5:
+        log.info("discovery: skipping — weekend")
+        return
+
+    log.info(f"discovery: starting ticker discovery at {now_et.strftime('%Y-%m-%d %H:%M ET')}")
+    try:
+        from ingestion.discover_tickers import run_discovery
+        run_discovery()
+        log.info("discovery: ticker discovery complete")
+    except Exception as e:
+        log.error(f"discovery: ticker discovery failed: {e}")
+
+
 # 10:00 AM, 1:00 PM, 3:30 PM ET on weekdays
 _TRIGGERS = [
     CronTrigger(hour=10, minute=0,  day_of_week="mon-fri", timezone=ET),
@@ -107,11 +122,14 @@ _TRIGGERS = [
 for trigger in _TRIGGERS:
     scheduler.add_job(run_market_session, trigger)
 
+# 9:00 AM ET on weekdays — 30 min before first trader run
+scheduler.add_job(run_discovery_job, CronTrigger(hour=9, minute=0, day_of_week="mon-fri", timezone=ET))
+
 
 @app.on_event("startup")
 async def startup():
     scheduler.start()
-    log.info("scheduler: started — 3 daily triggers (10:00, 13:00, 15:30 ET)")
+    log.info("scheduler: started — discovery 09:00, trader runs 10:00, 13:00, 15:30 ET")
 
 
 @app.on_event("shutdown")
@@ -397,6 +415,18 @@ def get_pending():
         .select("*")
         .eq("status", "pending")
         .order("created_at", desc=True)
+        .execute()
+    )
+    return result.data
+
+
+@app.get("/discovery/status")
+def get_discovery_status():
+    result = (
+        supabase.table("discovered_opportunities")
+        .select("*")
+        .eq("status", "active")
+        .order("added_at", desc=True)
         .execute()
     )
     return result.data
