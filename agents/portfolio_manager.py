@@ -37,6 +37,11 @@ Each element must have exactly these five keys:
 """
 
 
+_TRADER_INSTRUCTIONS = {
+    "alex": "IMPORTANT: You are managing Alex's book. Alex is a momentum trader. RSI above 75 + bullish MACD = BUY. Do not propose all HOLDs. Deploy capital.",
+}
+
+
 def decide_portfolio(
     news_summary: dict,
     tech_signals: dict,
@@ -45,6 +50,7 @@ def decide_portfolio(
     watchlist: list,
     cash: float = 0.0,
     trader_persona: str = "",
+    trader_id: str = "",
 ) -> list:
     max_per_trade = cash * 0.15
     sizing_rules = (
@@ -54,7 +60,10 @@ def decide_portfolio(
         f"  - SELL: sell all shares currently held.\n"
         f"  - HOLD: shares = 0."
     )
+    trader_instruction = _TRADER_INSTRUCTIONS.get(trader_id, "")
     system = _SYSTEM_BASE.format(sizing_rules=sizing_rules)
+    if trader_instruction:
+        system = system.rstrip() + f"\n\n{trader_instruction}\n"
 
     positions_text = (
         "\n".join(

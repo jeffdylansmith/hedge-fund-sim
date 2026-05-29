@@ -162,6 +162,7 @@ def portfolio_manager_node(state: HedgeFundState) -> dict:
             watchlist=state["watchlist"],
             cash=cash,
             trader_persona=state.get("trader_persona", ""),
+            trader_id=state["trader_id"],
         )
     except Exception as e:
         errors.append(f"portfolio_manager failed: {e}")
@@ -464,10 +465,7 @@ def run_all_traders() -> None:
 
 
 def run_graph(config: TraderConfig) -> dict:
-    persona = (
-        f"You are trading on behalf of {config.name}, a {config.personality}. "
-        f"Your risk tolerance is {config.risk_tolerance}."
-    )
+    persona = f"{config.personality}\n\nRisk tolerance: {config.risk_tolerance}"
     initial_state: HedgeFundState = {
         "ticker": "",
         "trader_id": config.trader_id,
