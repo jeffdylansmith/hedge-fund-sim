@@ -189,7 +189,7 @@ def risk_manager_node(state: HedgeFundState) -> dict:
             errors.append(
                 f"risk_manager: no fund_balance row for trader_id={state['trader_id']!r}, defaulting to $33,333"
             )
-            cash = 33_333.0
+            cash = 333_333.33
         else:
             cash = float(balance_rows.data[0]["cash"])
 
@@ -238,7 +238,7 @@ def vp_check_node(state: HedgeFundState) -> dict:
         errors.append(
             f"vp_check: no fund_balance row for trader_id={state['trader_id']!r}, defaulting to $33,333"
         )
-        capital = 33_333.0
+        capital = 333_333.33
     else:
         capital = float(balance_rows.data[0]["cash"])
 
@@ -278,7 +278,7 @@ def execute_trade_node(state: HedgeFundState) -> dict:
         errors.append(
             f"execute_trade: no fund_balance row for trader_id={trader_id!r}, defaulting to $33,333"
         )
-        cash = 33_333.0
+        cash = 333_333.33
     else:
         cash = float(balance_rows.data[0]["cash"])
 

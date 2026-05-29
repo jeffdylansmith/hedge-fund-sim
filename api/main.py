@@ -39,7 +39,7 @@ alpaca_client = (
     if _alpaca_key else None
 )
 
-STARTING_CASH = 33_333.0
+STARTING_CASH = 333_333.33
 TRADER_IDS = ["alex", "jordan", "casey"]
 ET = pytz.timezone("America/New_York")
 
