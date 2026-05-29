@@ -11,7 +11,7 @@ A multi-agent AI system that simulates a hedge fund with three competing traders
 Every trading session, the system:
 
 1. Screens the market for the day's biggest movers and most-active names, bootstraps 30 days of price history on new tickers, and rotates stale ones out after 14 days
-2. Runs a four-agent pipeline for each trader across every watched ticker — news sentiment, technical analysis, trade proposal, and risk assessment — each agent tuned to that trader's investment style
+2. Runs a seven-node LangGraph pipeline for each trader across every watched ticker — news sentiment, technical analysis, trade proposal, risk assessment, position sizing, and execution — each agent tuned to that trader's investment style
 3. Routes all trades directly to execution; VP circuit breaker converts oversized positions to HOLD rather than blocking execution
 4. Submits approved orders to an Alpaca paper trading account and logs every decision with full reasoning for audit
 
@@ -38,7 +38,7 @@ Every trading session, the system:
 
 ## Agent pipeline
 
-Each trader runs an independent instance of the same four-node LangGraph graph. Agents receive data through typed state — no free-text communication between nodes.
+Each trader runs an independent instance of the same 7-node LangGraph graph. Agents receive data through typed state — no free-text communication between nodes.
 
 ```mermaid
 flowchart LR
@@ -46,22 +46,21 @@ flowchart LR
     B --> C[technical_analyst]
     C --> D[portfolio_manager]
     D --> E[risk_manager]
-    E --> F{vp_check}
-    F -->|below threshold| G[execute_trade]
-    F -->|above threshold| H[human_review]
+    E --> F[vp_check]
+    F --> G[execute_trade]
 ```
 
 ### Nodes
 
-**`news_analyst`** — calls Claude with the last 48 hours of headlines for a ticker. Returns `{summary, sentiment}`. Persona-aware: Alex's analyst weights momentum catalysts; Jordan's applies a skeptical macro lens; Casey's looks for crowded-trade reversals.
+**`news_analyst`** — calls Claude with recent headlines for a ticker from `news_items`. Returns `{summary, sentiment}`. Persona-aware: Alex's analyst weights momentum catalysts; Jordan's applies a skeptical macro lens; Casey's looks for crowded-trade reversals.
 
-**`technical_analyst`** — computes RSI, MACD, and trend from price history in Python, then passes computed signals to Claude for interpretation. Returns `{trend, signals}`. Also persona-aware.
+**`technical_analyst`** — computes RSI, MACD, and trend from price history in Python, then passes computed signals to Claude for interpretation. Returns `{rsi, macd, trend, signals}`. Also persona-aware.
 
 **`portfolio_manager`** — receives the full state (news summary, technical signals, current positions, available cash) and proposes a trade. Returns `{ticker, action, shares, reasoning, confidence}`. Two-attempt retry loop with markdown fence stripping on the second attempt.
 
 **`risk_manager`** — computes position concentration in application code from live prices, injects it as a fact into the prompt, and asks Claude to assess risk. Returns `{risk_score, concentration_pct, flags, recommendation, rationale}`. The LLM interprets; the math happens in code.
 
-**`vp_check`** — pure Python. If `trade_value > available_capital × vp_threshold`, routes to `human_review`. No LLM call.
+**`vp_check`** — pure Python. If `trade_value > available_capital × vp_threshold`, converts the trade to HOLD in-place and logs the reason to state errors. Always routes to `execute_trade`. No LLM call.
 
 **`execute_trade`** — writes to Supabase, submits to Alpaca, decrements fund balance. Pre-trade cash check blocks any BUY that would overdraw the account.
 
@@ -110,7 +109,6 @@ flowchart TD
         RM[risk_manager]
         VP[vp_check]
         ET[execute_trade]
-        HR[human_review]
     end
 
     subgraph API ["FastAPI — Railway"]
@@ -136,9 +134,7 @@ flowchart TD
     PR --> G
     NW --> G
 
-    G --> NA --> TA --> PM --> RM --> VP
-    VP --> ET
-    VP --> HR
+    G --> NA --> TA --> PM --> RM --> VP --> ET
 
     NA --> LLM
     TA --> LLM
@@ -148,7 +144,6 @@ flowchart TD
     ET --> TR
     ET --> FB
     ET --> AD
-    HR --> PD
     RM --> AD
 
     TR --> API
