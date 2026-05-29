@@ -8,3 +8,5 @@ __pycache__/
 *.egg-info/
 dist/
 .pytest_cache/
+.claude/
+requirements_full.txt
