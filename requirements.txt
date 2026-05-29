@@ -1,4 +1,4 @@
-alpaca-trade-api==3.3.2
+alpaca-py==0.40.0
 annotated-doc==0.0.4
 annotated-types==0.7.0
 apscheduler==3.10.4
