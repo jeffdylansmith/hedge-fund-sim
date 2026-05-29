@@ -137,6 +137,22 @@ _TRADE_KEYS = {"ticker", "action", "shares", "reasoning", "confidence"}
 
 def portfolio_manager_node(state: HedgeFundState) -> dict:
     errors = list(state.get("errors", []))
+
+    balance_rows = (
+        supabase.table("fund_balance")
+        .select("cash")
+        .eq("trader_id", state["trader_id"])
+        .limit(1)
+        .execute()
+    )
+    if not balance_rows.data:
+        errors.append(
+            f"portfolio_manager: no fund_balance row for trader_id={state['trader_id']!r}, defaulting to $333,333"
+        )
+        cash = 333_333.33
+    else:
+        cash = float(balance_rows.data[0]["cash"])
+
     try:
         result = decide_portfolio(
             news_summary=state["news_summary"],
@@ -144,20 +160,28 @@ def portfolio_manager_node(state: HedgeFundState) -> dict:
             positions=state["positions"],
             current_prices=state["current_prices"],
             watchlist=state["watchlist"],
+            cash=cash,
             trader_persona=state.get("trader_persona", ""),
         )
     except Exception as e:
         errors.append(f"portfolio_manager failed: {e}")
         return {"trade_proposal": [], "errors": errors}
 
+    existing_tickers = {p["ticker"] for p in state["positions"]}
+
     valid = []
     for trade in result:
         if not isinstance(trade, dict) or not _TRADE_KEYS.issubset(trade.keys()):
             errors.append(f"portfolio_manager: invalid trade object: {trade}")
             continue
+        action = str(trade["action"]).upper()
+        ticker = str(trade["ticker"]).upper()
+        if action == "SELL" and ticker not in existing_tickers:
+            errors.append(f"portfolio_manager: dropping phantom SELL for {ticker} — no existing position")
+            continue
         valid.append({
-            "ticker": str(trade["ticker"]).upper(),
-            "action": str(trade["action"]).upper(),
+            "ticker": ticker,
+            "action": action,
             "shares": int(trade["shares"]) if trade["shares"] else 0,
             "reasoning": str(trade["reasoning"]),
             "confidence": float(trade["confidence"]),
@@ -223,10 +247,6 @@ def risk_manager_node(state: HedgeFundState) -> dict:
 def vp_check_node(state: HedgeFundState) -> dict:
     errors = list(state.get("errors", []))
 
-    if not state.get("trade_proposal"):
-        errors.append("vp_check: trade_proposal is empty, routing to human_review")
-        return {"vp_verdict": "human_review", "errors": errors}
-
     balance_rows = (
         supabase.table("fund_balance")
         .select("cash")
@@ -236,7 +256,7 @@ def vp_check_node(state: HedgeFundState) -> dict:
     )
     if not balance_rows.data:
         errors.append(
-            f"vp_check: no fund_balance row for trader_id={state['trader_id']!r}, defaulting to $33,333"
+            f"vp_check: no fund_balance row for trader_id={state['trader_id']!r}, defaulting to $333,333"
         )
         capital = 333_333.33
     else:
@@ -244,21 +264,20 @@ def vp_check_node(state: HedgeFundState) -> dict:
 
     threshold = capital * state["vp_threshold"]
 
-    for trade in state["trade_proposal"]:
+    filtered = []
+    for trade in state.get("trade_proposal", []):
         price = state["current_prices"].get(trade["ticker"], 0.0)
         notional = trade["shares"] * price
         if notional > threshold:
             errors.append(
-                f"vp_check: {trade['ticker']} notional ${notional:,.2f} exceeds 50% threshold ${threshold:,.2f}"
+                f"vp_check: {trade['ticker']} notional ${notional:,.2f} exceeds threshold "
+                f"${threshold:,.2f} — converting to HOLD"
             )
-            return {"vp_verdict": "human_review", "errors": errors}
+            filtered.append({**trade, "action": "HOLD", "shares": 0})
+        else:
+            filtered.append(trade)
 
-    return {"vp_verdict": "execute_trade", "errors": errors}
-
-
-def route_after_vp(state: HedgeFundState) -> str:
-    verdict = state.get("vp_verdict", "")
-    return verdict if verdict in ("execute_trade", "human_review") else "human_review"
+    return {"trade_proposal": filtered, "vp_verdict": "execute_trade", "errors": errors}
 
 
 def execute_trade_node(state: HedgeFundState) -> dict:
@@ -480,7 +499,6 @@ _builder.add_node("portfolio_manager_node", portfolio_manager_node)
 _builder.add_node("risk_manager_node", risk_manager_node)
 _builder.add_node("vp_check_node", vp_check_node)
 _builder.add_node("execute_trade_node", execute_trade_node)
-_builder.add_node("human_review_node", human_review_node)
 
 _builder.add_edge(START, "fetch_data")
 _builder.add_edge("fetch_data", "news_analyst_node")
@@ -488,16 +506,8 @@ _builder.add_edge("news_analyst_node", "technical_analyst_node")
 _builder.add_edge("technical_analyst_node", "portfolio_manager_node")
 _builder.add_edge("portfolio_manager_node", "risk_manager_node")
 _builder.add_edge("risk_manager_node", "vp_check_node")
-_builder.add_conditional_edges(
-    "vp_check_node",
-    route_after_vp,
-    {
-        "execute_trade": "execute_trade_node",
-        "human_review": "human_review_node",
-    },
-)
+_builder.add_edge("vp_check_node", "execute_trade_node")
 _builder.add_edge("execute_trade_node", END)
-_builder.add_edge("human_review_node", END)
 
 graph = _builder.compile()
 

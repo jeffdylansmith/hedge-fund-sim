@@ -8,7 +8,7 @@ load_dotenv()
 
 _client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
 
-_SYSTEM = """You are a disciplined portfolio manager with 20 years of experience running a \
+_SYSTEM_BASE = """You are a disciplined portfolio manager with 20 years of experience running a \
 mid-sized hedge fund. You have lived through the 2008 crash and 2020 pandemic. Your number \
 one rule is never let a bad position get worse. You think in risk/reward ratios and always \
 ask yourself what happens if you are wrong. Never go all-in on a single position, always \
@@ -22,13 +22,10 @@ You will receive:
 "signals" (string summary of strongest signals)
   - Current portfolio positions (list of objects with ticker, shares, avg_cost)
   - Current prices (object mapping ticker → latest close price as float)
+  - Available cash
 
 For each ticker in the provided watchlist, output exactly one decision.
-Position sizing rules:
-  - BUY: max 15% of $100,000 total capital per position = max $15,000 per trade.
-    Calculate shares as floor(15000 / current_price).
-  - SELL: sell all shares currently held.
-  - HOLD: shares = 0.
+{sizing_rules}
 
 Respond ONLY with a valid JSON array — no preamble, no markdown, no explanation.
 Each element must have exactly these five keys:
@@ -46,8 +43,19 @@ def decide_portfolio(
     positions: list,
     current_prices: dict,
     watchlist: list,
+    cash: float = 0.0,
     trader_persona: str = "",
 ) -> list:
+    max_per_trade = cash * 0.15
+    sizing_rules = (
+        f"Position sizing rules:\n"
+        f"  - BUY: max 15% of ${cash:,.0f} available cash per position = max ${max_per_trade:,.0f} per trade.\n"
+        f"    Calculate shares as floor({max_per_trade:,.0f} / current_price).\n"
+        f"  - SELL: sell all shares currently held.\n"
+        f"  - HOLD: shares = 0."
+    )
+    system = _SYSTEM_BASE.format(sizing_rules=sizing_rules)
+
     positions_text = (
         "\n".join(
             f"  {p['ticker']}: {p['shares']} shares @ avg ${p['avg_cost']:.2f}"
@@ -69,11 +77,13 @@ Current Positions:
 Current Prices:
 {prices_text}
 
+Available Cash: ${cash:,.2f}
+
 Watchlist: {', '.join(watchlist)}
 
 Return a JSON array with one decision object per ticker in the watchlist."""
 
-    effective_system = f"{trader_persona}\n\n{_SYSTEM}" if trader_persona else _SYSTEM
+    effective_system = f"{trader_persona}\n\n{system}" if trader_persona else system
 
     msg = _client.messages.create(
         model="claude-haiku-4-5-20251001",
