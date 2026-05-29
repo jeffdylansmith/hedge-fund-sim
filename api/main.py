@@ -1,11 +1,18 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.cron import CronTrigger
 from supabase import create_client
 from dotenv import load_dotenv
 from datetime import datetime, timezone
+import pytz
+import logging
 import os
 
 load_dotenv()
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("meridian")
 
 app = FastAPI(title="Hedge Fund Sim API")
 
@@ -26,7 +33,134 @@ supabase = create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_KEY"))
 
 STARTING_CASH = 33_333.0
 TRADER_IDS = ["alex", "jordan", "casey"]
+ET = pytz.timezone("America/New_York")
 
+# ---------------------------------------------------------------------------
+# Scheduler
+# ---------------------------------------------------------------------------
+
+scheduler = BackgroundScheduler(timezone=ET)
+
+
+def _is_paused() -> bool:
+    try:
+        row = (
+            supabase.table("scheduler_config")
+            .select("value")
+            .eq("key", "paused")
+            .limit(1)
+            .execute()
+        )
+        return bool(row.data and row.data[0]["value"] == "true")
+    except Exception as e:
+        log.warning(f"scheduler: could not read pause state: {e}")
+        return False
+
+
+def _log_run(status: str, error: str | None = None) -> None:
+    try:
+        supabase.table("scheduler_runs").insert({
+            "ran_at": datetime.now(timezone.utc).isoformat(),
+            "status": status,
+            "error": error,
+        }).execute()
+    except Exception as e:
+        log.warning(f"scheduler: could not write run log: {e}")
+
+
+def run_market_session() -> None:
+    now_et = datetime.now(ET)
+    if now_et.weekday() >= 5:  # Saturday=5, Sunday=6
+        log.info("scheduler: skipping — weekend")
+        return
+
+    if _is_paused():
+        log.info("scheduler: skipping — paused via scheduler_config")
+        _log_run("paused")
+        return
+
+    log.info(f"scheduler: starting market session at {now_et.strftime('%Y-%m-%d %H:%M ET')}")
+    try:
+        from agents.graph import run_all_traders
+        run_all_traders()
+        log.info("scheduler: market session complete")
+        _log_run("success")
+    except Exception as e:
+        log.error(f"scheduler: market session failed: {e}")
+        _log_run("error", str(e)[:500])
+
+
+# 10:00 AM, 1:00 PM, 3:30 PM ET on weekdays
+_TRIGGERS = [
+    CronTrigger(hour=10, minute=0,  day_of_week="mon-fri", timezone=ET),
+    CronTrigger(hour=13, minute=0,  day_of_week="mon-fri", timezone=ET),
+    CronTrigger(hour=15, minute=30, day_of_week="mon-fri", timezone=ET),
+]
+for trigger in _TRIGGERS:
+    scheduler.add_job(run_market_session, trigger)
+
+
+@app.on_event("startup")
+async def startup():
+    scheduler.start()
+    log.info("scheduler: started — 3 daily triggers (10:00, 13:00, 15:30 ET)")
+
+
+@app.on_event("shutdown")
+async def shutdown():
+    scheduler.shutdown(wait=False)
+    log.info("scheduler: shut down")
+
+
+# ---------------------------------------------------------------------------
+# Scheduler endpoints
+# ---------------------------------------------------------------------------
+
+@app.get("/scheduler/status")
+def scheduler_status():
+    jobs = scheduler.get_jobs()
+    next_runs = sorted(
+        [j.next_run_time for j in jobs if j.next_run_time],
+        key=lambda t: t
+    )[:3]
+    return {
+        "running": scheduler.running,
+        "paused": _is_paused(),
+        "next_runs": [t.isoformat() for t in next_runs],
+    }
+
+
+@app.post("/scheduler/pause")
+def pause_scheduler():
+    try:
+        existing = supabase.table("scheduler_config").select("key").eq("key", "paused").execute()
+        if existing.data:
+            supabase.table("scheduler_config").update({"value": "true"}).eq("key", "paused").execute()
+        else:
+            supabase.table("scheduler_config").insert({"key": "paused", "value": "true"}).execute()
+        log.info("scheduler: paused via API")
+        return {"paused": True}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/scheduler/unpause")
+def unpause_scheduler():
+    try:
+        existing = supabase.table("scheduler_config").select("key").eq("key", "paused").execute()
+        if existing.data:
+            supabase.table("scheduler_config").update({"value": "false"}).eq("key", "paused").execute()
+        else:
+            supabase.table("scheduler_config").insert({"key": "paused", "value": "false"}).execute()
+        log.info("scheduler: unpaused via API")
+        return {"paused": False}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ---------------------------------------------------------------------------
+# Existing endpoints
+# ---------------------------------------------------------------------------
 
 @app.get("/")
 def root():
@@ -73,12 +207,10 @@ def get_portfolio():
 
 @app.get("/fund/summary")
 def get_fund_summary():
-    # Cash balances
     balances = supabase.table("fund_balance").select("trader_id, cash").execute()
     balance_map = {row["trader_id"]: float(row["cash"]) for row in balances.data}
     total_cash = sum(balance_map.get(t, STARTING_CASH) for t in TRADER_IDS)
 
-    # Estimate position values using latest prices
     positions = supabase.table("portfolio_positions").select("ticker, shares, trader_id").execute()
     tickers = list({p["ticker"] for p in positions.data})
     current_prices = {}
@@ -100,11 +232,9 @@ def get_fund_summary():
     )
     total_fund_value = total_cash + position_value
 
-    # Total trades
     trades = supabase.table("trades").select("id", count="exact").execute()
     total_trades = trades.count or 0
 
-    # Decisions today
     today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
     decisions_today = (
         supabase.table("agent_decisions")
@@ -114,7 +244,6 @@ def get_fund_summary():
     )
     decisions_today_count = decisions_today.count or 0
 
-    # Best performer by P&L (cash vs starting)
     best_trader = None
     best_pnl = None
     for trader_id in TRADER_IDS:
