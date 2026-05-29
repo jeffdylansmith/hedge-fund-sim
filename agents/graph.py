@@ -34,6 +34,8 @@ class HedgeFundState(TypedDict):
     vp_verdict: str                # "execute_trade" or "human_review"
     vp_threshold: float            # fraction of capital that triggers human review (from TraderConfig)
     trader_persona: str            # prepended to PM system prompt (from TraderConfig)
+    news_analyst_persona: str      # prepended to news analyst system prompt (from TraderConfig)
+    tech_analyst_persona: str      # prepended to technical analyst system prompt (from TraderConfig)
     errors: List[str]              # accumulated non-fatal errors from any node
 
 
@@ -83,7 +85,7 @@ def fetch_data(state: HedgeFundState) -> dict:
 def news_analyst_node(state: HedgeFundState) -> dict:
     errors = list(state.get("errors", []))
     try:
-        result = analyze_news(state["news_items"])
+        result = analyze_news(state["news_items"], persona=state.get("news_analyst_persona", ""))
     except Exception as e:
         errors.append(f"news_analyst failed: {e}")
         return {"news_summary": {}, "errors": errors}
@@ -107,7 +109,7 @@ def news_analyst_node(state: HedgeFundState) -> dict:
 def technical_analyst_node(state: HedgeFundState) -> dict:
     errors = list(state.get("errors", []))
     try:
-        result = analyze_technicals(state["prices"], state["watchlist"])
+        result = analyze_technicals(state["prices"], state["watchlist"], persona=state.get("tech_analyst_persona", ""))
     except Exception as e:
         errors.append(f"technical_analyst failed: {e}")
         return {"tech_signals": {}, "errors": errors}
@@ -369,6 +371,8 @@ def run_graph(config: TraderConfig) -> dict:
         "trader_id": config.trader_id,
         "vp_threshold": config.vp_threshold,
         "trader_persona": persona,
+        "news_analyst_persona": config.news_analyst_persona,
+        "tech_analyst_persona": config.tech_analyst_persona,
         "watchlist": [],
         "prices": [],
         "current_prices": {},
