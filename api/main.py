@@ -11,7 +11,13 @@ app = FastAPI(title="Hedge Fund Sim API")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[
+        "http://localhost:5173",
+        "https://hedge-fund-sim-production.up.railway.app",
+        "https://hedge-fund-sim.vercel.app",
+        "https://*.vercel.app",
+    ],
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
