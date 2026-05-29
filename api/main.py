@@ -2,6 +2,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
+from alpaca.trading.client import TradingClient
 from supabase import create_client
 from dotenv import load_dotenv
 from datetime import datetime, timezone
@@ -30,6 +31,13 @@ app.add_middleware(
 )
 
 supabase = create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_KEY"))
+
+_alpaca_key = os.getenv("ALPACA_API_KEY")
+_alpaca_secret = os.getenv("ALPACA_SECRET_KEY")
+alpaca_client = (
+    TradingClient(_alpaca_key, _alpaca_secret, paper=True)
+    if _alpaca_key else None
+)
 
 STARTING_CASH = 33_333.0
 TRADER_IDS = ["alex", "jordan", "casey"]
@@ -156,6 +164,21 @@ def unpause_scheduler():
         return {"paused": False}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ---------------------------------------------------------------------------
+# Alpaca endpoints
+# ---------------------------------------------------------------------------
+
+@app.get("/alpaca/positions")
+def get_alpaca_positions():
+    if not alpaca_client:
+        raise HTTPException(status_code=503, detail="Alpaca client not configured — set ALPACA_API_KEY and ALPACA_SECRET_KEY env vars")
+    try:
+        positions = alpaca_client.get_all_positions()
+        return [p.model_dump() for p in positions]
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Alpaca API error: {e}")
 
 
 # ---------------------------------------------------------------------------

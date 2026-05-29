@@ -1,12 +1,23 @@
 import json
+import os
 from datetime import datetime, timezone
 from typing import TypedDict, List, Dict
 from langgraph.graph import StateGraph, START, END
+from alpaca.trading.client import TradingClient
+from alpaca.trading.requests import MarketOrderRequest
+from alpaca.trading.enums import OrderSide, TimeInForce
 from utils.db import supabase
 from agents.news_analyst import analyze_news
 from agents.technical_analyst import analyze_technicals
 from agents.portfolio_manager import decide_portfolio
 from agents.trader_config import TraderConfig
+
+ALPACA_API_KEY = os.getenv("ALPACA_API_KEY")
+ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY")
+alpaca_client = (
+    TradingClient(ALPACA_API_KEY, ALPACA_SECRET_KEY, paper=True)
+    if ALPACA_API_KEY else None
+)
 
 
 class HedgeFundState(TypedDict):
@@ -222,7 +233,7 @@ def execute_trade_node(state: HedgeFundState) -> dict:
 
         total_value = shares * price
 
-        supabase.table("trades").insert({
+        trade_result = supabase.table("trades").insert({
             "ticker": ticker,
             "action": action.lower(),
             "shares": shares,
@@ -231,6 +242,23 @@ def execute_trade_node(state: HedgeFundState) -> dict:
             "executed_at": now,
             "trader_id": trader_id,
         }).execute()
+        trade_id = trade_result.data[0]["id"] if trade_result.data else None
+
+        if alpaca_client:
+            try:
+                order = MarketOrderRequest(
+                    symbol=ticker,
+                    qty=shares,
+                    side=OrderSide.BUY if action == "BUY" else OrderSide.SELL,
+                    time_in_force=TimeInForce.DAY,
+                )
+                alpaca_client.submit_order(order)
+                if trade_id:
+                    supabase.table("trades").update(
+                        {"alpaca_submitted": True}
+                    ).eq("id", trade_id).execute()
+            except Exception as e:
+                errors.append(f"Alpaca order failed for {ticker}: {e}")
 
         existing = positions_by_ticker.get(ticker)
         if existing:
