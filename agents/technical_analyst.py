@@ -73,11 +73,12 @@ def analyze_technicals(prices: list, watchlist: list, persona: str = "") -> dict
 
     system = (persona + "\n\n" + _SYSTEM) if persona else _SYSTEM
 
-    blocks = [_compute_indicators(ticker, prices_by_ticker.get(ticker, [])) for ticker in watchlist]
+    eligible = [t for t in watchlist if len(prices_by_ticker.get(t, [])) >= 14]
+    blocks = [_compute_indicators(ticker, prices_by_ticker[ticker]) for ticker in eligible]
 
     message = _client.messages.create(
         model="claude-haiku-4-5-20251001",
-        max_tokens=1024,
+        max_tokens=4096,
         system=system,
         messages=[
             {
@@ -100,8 +101,8 @@ def analyze_technicals(prices: list, watchlist: list, persona: str = "") -> dict
     except json.JSONDecodeError as e:
         print(f"technical_analyst: JSON parse failed: {e}\nRaw response: {raw[:200]}", file=sys.stderr)
         return {
-            "rsi":     {ticker: None      for ticker in watchlist},
-            "macd":    {ticker: "unknown" for ticker in watchlist},
-            "trend":   {ticker: "unknown" for ticker in watchlist},
+            "rsi":     {ticker: None      for ticker in eligible},
+            "macd":    {ticker: "unknown" for ticker in eligible},
+            "trend":   {ticker: "unknown" for ticker in eligible},
             "signals": "Analysis unavailable due to parse error.",
         }
