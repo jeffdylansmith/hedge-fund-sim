@@ -438,11 +438,11 @@ def reconcile_positions() -> dict:
                     # CASE 1: share count mismatch
                     cash_delta = (db_shares - alpaca_shares) * avg_cost
                     supabase.rpc("reconcile_position", {
-                        "p_trader_id": trader_id,
-                        "p_ticker":    ticker,
-                        "p_shares":    alpaca_shares,
-                        "p_avg_cost":  avg_cost,
-                        "p_cash_delta": cash_delta,
+                        "p_trader_id":    trader_id,
+                        "p_ticker":       ticker,
+                        "p_alpaca_shares": alpaca_shares,
+                        "p_avg_cost":     avg_cost,
+                        "p_cash_delta":   cash_delta,
                     }).execute()
                     resolution = "corrected"
                     notes = (
@@ -453,11 +453,11 @@ def reconcile_positions() -> dict:
                 elif alpaca_pos and not db_pos:
                     # CASE 2: Alpaca position missing from DB
                     supabase.rpc("reconcile_position", {
-                        "p_trader_id":  trader_id,
-                        "p_ticker":     ticker,
-                        "p_shares":     alpaca_shares,
-                        "p_avg_cost":   alpaca_pos["avg_entry_price"],
-                        "p_cash_delta": 0,
+                        "p_trader_id":    trader_id,
+                        "p_ticker":       ticker,
+                        "p_alpaca_shares": alpaca_shares,
+                        "p_avg_cost":     alpaca_pos["avg_entry_price"],
+                        "p_cash_delta":   0,
                     }).execute()
                     resolution = "position_added"
                     notes = (
@@ -470,6 +470,8 @@ def reconcile_positions() -> dict:
                     supabase.rpc("remove_ghost_position", {
                         "p_trader_id": trader_id,
                         "p_ticker":    ticker,
+                        "p_shares":    db_shares,
+                        "p_avg_cost":  avg_cost,
                     }).execute()
                     resolution = "position_removed"
                     notes = f"Removed ghost position: {db_shares} shares not found in Alpaca"
