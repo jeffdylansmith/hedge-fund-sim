@@ -2,6 +2,7 @@ import anthropic
 import json
 import os
 import re
+import sys
 import pandas as pd
 from dotenv import load_dotenv
 
@@ -87,5 +88,20 @@ def analyze_technicals(prices: list, watchlist: list, persona: str = "") -> dict
     )
 
     raw = message.content[0].text.strip()
+
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        pass
+
     clean = re.sub(r"^```json\s*|^```\s*|```$", "", raw, flags=re.MULTILINE).strip()
-    return json.loads(clean)
+    try:
+        return json.loads(clean)
+    except json.JSONDecodeError as e:
+        print(f"technical_analyst: JSON parse failed: {e}\nRaw response: {raw[:200]}", file=sys.stderr)
+        return {
+            "rsi":     {ticker: None      for ticker in watchlist},
+            "macd":    {ticker: "unknown" for ticker in watchlist},
+            "trend":   {ticker: "unknown" for ticker in watchlist},
+            "signals": "Analysis unavailable due to parse error.",
+        }

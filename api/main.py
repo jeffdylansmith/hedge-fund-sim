@@ -1,21 +1,44 @@
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.interval import IntervalTrigger
 from alpaca.trading.client import TradingClient
+from alpaca.trading.requests import MarketOrderRequest
+from alpaca.trading.enums import OrderSide, TimeInForce
 from supabase import create_client
 from dotenv import load_dotenv
-from datetime import datetime, timezone
+from datetime import datetime, date, time, timezone
+import anthropic
 import pytz
 import logging
 import os
+import yfinance as yf
 
 load_dotenv()
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("meridian")
 
-app = FastAPI(title="Hedge Fund Sim API")
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    scheduler.start()
+    log.info(
+        "scheduler: started — discovery 09:00, trader runs 08:30–16:00, "
+        "EOD flatten 15:45, EOD summary 16:05, reconcile every 30min ET"
+    )
+    try:
+        summary = reconcile_positions()
+        log.info(f"startup reconciliation: {summary}")
+    except Exception as e:
+        log.warning(f"startup reconciliation failed: {e}")
+    yield
+    scheduler.shutdown(wait=False)
+    log.info("scheduler: shut down")
+
+
+app = FastAPI(title="Hedge Fund Sim API", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -39,9 +62,42 @@ alpaca_client = (
     if _alpaca_key else None
 )
 
+_anthropic_client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+
+_TRADER_PERSONALITIES = {
+    "alex":   "aggressive momentum trader who buys breakouts and hates missing moves",
+    "jordan": "conservative macro investor who thinks everyone trades too much",
+    "casey":  "contrarian who suspects every consensus trade is a trap",
+}
+
 STARTING_CASH = 333_333.33
 TRADER_IDS = ["alex", "jordan", "casey"]
 ET = pytz.timezone("America/New_York")
+_last_reconcile_summary: dict = {}
+
+_NYSE_HOLIDAYS_2026 = {
+    date(2026, 1,  1),   # New Year's Day
+    date(2026, 1, 19),   # MLK Day
+    date(2026, 2, 16),   # Presidents Day
+    date(2026, 4,  3),   # Good Friday
+    date(2026, 5, 25),   # Memorial Day
+    date(2026, 7,  3),   # Independence Day (observed)
+    date(2026, 9,  7),   # Labor Day
+    date(2026, 11, 26),  # Thanksgiving
+    date(2026, 11, 27),  # Day after Thanksgiving (treat as closed)
+    date(2026, 12, 25),  # Christmas
+}
+
+
+def is_market_hours() -> bool:
+    now_et = datetime.now(ET)
+    if now_et.weekday() >= 5:
+        return False
+    if now_et.date() in _NYSE_HOLIDAYS_2026:
+        return False
+    t = now_et.time()
+    return time(8, 30) <= t <= time(16, 0)
+
 
 # ---------------------------------------------------------------------------
 # Scheduler
@@ -76,10 +132,49 @@ def _log_run(status: str, error: str | None = None) -> None:
         log.warning(f"scheduler: could not write run log: {e}")
 
 
+def refresh_current_prices() -> None:
+    try:
+        rows = supabase.table("watchlist").select("ticker").execute()
+        tickers = [r["ticker"] for r in rows.data]
+    except Exception as e:
+        log.error(f"refresh_prices: could not fetch watchlist: {e}")
+        return
+
+    refreshed, failed = 0, []
+    for ticker in tickers:
+        try:
+            df = yf.download(
+                ticker, period="1d", interval="1h",
+                progress=False, auto_adjust=True, multi_level_index=False,
+            )
+            if df.empty:
+                failed.append(f"{ticker}(no data)")
+                continue
+            row = df.iloc[-1]
+            ts = df.index[-1]
+            supabase.table("prices").upsert({
+                "ticker": ticker,
+                "timestamp": ts.isoformat(),
+                "open":   float(row["Open"]),
+                "high":   float(row["High"]),
+                "low":    float(row["Low"]),
+                "close":  float(row["Close"]),
+                "volume": int(row["Volume"]),
+            }, on_conflict="ticker,timestamp").execute()
+            refreshed += 1
+        except Exception as e:
+            failed.append(f"{ticker}({e})")
+
+    msg = f"refresh_prices: {refreshed}/{len(tickers)} tickers refreshed"
+    if failed:
+        msg += f" — failures: {', '.join(failed)}"
+    log.info(msg)
+
+
 def run_market_session() -> None:
-    now_et = datetime.now(ET)
-    if now_et.weekday() >= 5:  # Saturday=5, Sunday=6
-        log.info("scheduler: skipping — weekend")
+    if not is_market_hours():
+        log.info("scheduler: skipping — outside market hours")
+        _log_run("skipped")
         return
 
     if _is_paused():
@@ -87,8 +182,10 @@ def run_market_session() -> None:
         _log_run("paused")
         return
 
+    now_et = datetime.now(ET)
     log.info(f"scheduler: starting market session at {now_et.strftime('%Y-%m-%d %H:%M ET')}")
     try:
+        refresh_current_prices()
         from agents.graph import run_all_traders
         run_all_traders()
         log.info("scheduler: market session complete")
@@ -99,11 +196,11 @@ def run_market_session() -> None:
 
 
 def run_discovery_job() -> None:
-    now_et = datetime.now(ET)
-    if now_et.weekday() >= 5:
-        log.info("discovery: skipping — weekend")
+    if not is_market_hours():
+        log.info("discovery: skipping — outside market hours")
         return
 
+    now_et = datetime.now(ET)
     log.info(f"discovery: starting ticker discovery at {now_et.strftime('%Y-%m-%d %H:%M ET')}")
     try:
         from ingestion.discover_tickers import run_discovery
@@ -113,29 +210,318 @@ def run_discovery_job() -> None:
         log.error(f"discovery: ticker discovery failed: {e}")
 
 
-# 10:00 AM, 1:00 PM, 3:30 PM ET on weekdays
-_TRIGGERS = [
-    CronTrigger(hour=10, minute=0,  day_of_week="mon-fri", timezone=ET),
-    CronTrigger(hour=13, minute=0,  day_of_week="mon-fri", timezone=ET),
-    CronTrigger(hour=15, minute=30, day_of_week="mon-fri", timezone=ET),
-]
-for trigger in _TRIGGERS:
-    scheduler.add_job(run_market_session, trigger)
+def flatten_all_positions() -> None:
+    if _is_paused():
+        log.info("eod_flatten: skipping — paused")
+        return
 
-# 9:00 AM ET on weekdays — 30 min before first trader run
+    positions = supabase.table("portfolio_positions").select("*").execute()
+    if not positions.data:
+        log.info("EOD flatten: no open positions to close")
+        return
+
+    tickers = list({p["ticker"] for p in positions.data})
+    current_prices = get_latest_prices(tickers)
+    now = datetime.now(timezone.utc).isoformat()
+
+    closed = 0
+    records_written = 0
+    failures = 0
+    trader_set: set = set()
+
+    for pos in positions.data:
+        trader_id  = pos["trader_id"]
+        ticker     = pos["ticker"]
+        shares     = pos["shares"]
+        sale_price = current_prices.get(ticker, float(pos["avg_cost"]))
+        total_value = shares * sale_price
+
+        try:
+            supabase.rpc("flatten_position", {
+                "p_trader_id": trader_id,
+                "p_ticker":    ticker,
+                "p_shares":    shares,
+                "p_price":     sale_price,
+            }).execute()
+        except Exception as e:
+            log.error(f"eod_flatten: RPC failed for {ticker} ({trader_id}): {e}")
+            failures += 1
+            continue
+
+        closed += 1
+        trader_set.add(trader_id)
+
+        if alpaca_client:
+            try:
+                order = MarketOrderRequest(
+                    symbol=ticker,
+                    qty=shares,
+                    side=OrderSide.SELL,
+                    time_in_force=TimeInForce.DAY,
+                )
+                alpaca_client.submit_order(order)
+            except Exception as e:
+                log.warning(f"eod_flatten: Alpaca SELL failed for {ticker}: {e}")
+
+        try:
+            alpaca_ok = alpaca_client is not None
+            supabase.table("trades").insert({
+                "ticker":           ticker,
+                "action":           "sell",
+                "shares":           shares,
+                "price":            sale_price,
+                "total_value":      total_value,
+                "executed_at":      now,
+                "trader_id":        trader_id,
+                "alpaca_submitted": alpaca_ok,
+            }).execute()
+            records_written += 1
+        except Exception as e:
+            log.warning(f"eod_flatten: trade record failed for {ticker} ({trader_id}): {e}")
+
+    log.info(
+        f"EOD flatten: closed {closed} positions via RPC, "
+        f"{records_written} trade records written, {failures} failures"
+    )
+
+
+def generate_daily_summaries() -> None:
+    if _is_paused():
+        log.info("eod_summary: skipping — paused")
+        return
+
+    today_start = datetime.now(timezone.utc).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    ).isoformat()
+    now = datetime.now(timezone.utc).isoformat()
+
+    for trader_id in TRADER_IDS:
+        try:
+            trades_rows = (
+                supabase.table("trades")
+                .select("ticker, action, shares, price, total_value")
+                .eq("trader_id", trader_id)
+                .gte("executed_at", today_start)
+                .execute()
+            )
+            decisions_rows = (
+                supabase.table("agent_decisions")
+                .select("action, ticker")
+                .eq("trader_id", trader_id)
+                .gte("created_at", today_start)
+                .neq("action", "trader_reaction")
+                .neq("action", "daily_summary")
+                .execute()
+            )
+
+            trade_lines = [
+                f"{t['action'].upper()} {t['shares']} {t['ticker']} @ ${t['price']:.2f}"
+                for t in trades_rows.data
+            ]
+            net_pnl = sum(
+                t["total_value"] if t["action"] == "sell" else -t["total_value"]
+                for t in trades_rows.data
+            )
+
+            buy_count  = sum(1 for d in decisions_rows.data if d["action"] == "BUY")
+            sell_count = sum(1 for d in decisions_rows.data if d["action"] == "SELL")
+            hold_count = sum(1 for d in decisions_rows.data if d["action"] == "HOLD")
+
+            trader_name = trader_id.capitalize()
+            personality = _TRADER_PERSONALITIES.get(trader_id, "")
+
+            system = (
+                f"{trader_name} is a {personality}. "
+                "Write your EOD trading journal entry. Max 5 lines. "
+                "Be specific about what you traded and why. Stay in character. No disclaimers."
+            )
+            user_content = (
+                f"Your trades today:\n"
+                + ("\n".join(trade_lines) if trade_lines else "No trades executed today.")
+                + f"\n\nDecisions made: {buy_count} BUY, {sell_count} SELL, {hold_count} HOLD\n"
+                + f"Net P&L today: ${net_pnl:+,.2f}\n\n"
+                + "Summarize your day."
+            )
+
+            msg = _anthropic_client.messages.create(
+                model="claude-haiku-4-5-20251001",
+                max_tokens=256,
+                system=system,
+                messages=[{"role": "user", "content": user_content}],
+            )
+            summary_text = msg.content[0].text.strip()
+
+            supabase.table("agent_decisions").insert({
+                "agent_name": trader_name,
+                "trader_id":  trader_id,
+                "ticker":     "PORTFOLIO",
+                "action":     "daily_summary",
+                "reasoning":  summary_text,
+                "confidence": None,
+                "created_at": now,
+            }).execute()
+
+            log.info(f"eod_summary: {trader_name} summary written")
+
+        except Exception as e:
+            log.error(f"eod_summary: {trader_id} failed: {e}")
+
+    log.info(f"EOD summary: completed for {len(TRADER_IDS)} traders")
+
+
+def reconcile_positions() -> dict:
+    global _last_reconcile_summary
+    checked = corrections = errors = 0
+
+    try:
+        if not alpaca_client:
+            log.info("reconcile: no Alpaca client configured, skipping")
+            return {"checked": 0, "corrections": 0, "errors": 0, "ran_at": datetime.now(timezone.utc).isoformat()}
+
+        alpaca_pos_list = alpaca_client.get_all_positions()
+        alpaca_by_ticker = {
+            p.symbol: {"shares": int(float(p.qty)), "avg_entry_price": float(p.avg_entry_price)}
+            for p in alpaca_pos_list
+        }
+
+        db_rows = supabase.table("portfolio_positions").select("*").execute()
+        db_by_key: dict = {}
+        for p in db_rows.data:
+            db_by_key[(p["trader_id"], p["ticker"])] = p
+
+        # Map each Alpaca ticker → trader_id via most recent alpaca_submitted trade
+        ticker_to_trader: dict = {}
+        for ticker in alpaca_by_ticker:
+            rows = (
+                supabase.table("trades")
+                .select("trader_id")
+                .eq("ticker", ticker)
+                .eq("alpaca_submitted", True)
+                .order("executed_at", desc=True)
+                .limit(1)
+                .execute()
+            )
+            if rows.data:
+                ticker_to_trader[ticker] = rows.data[0]["trader_id"]
+
+        # Fallback: trader with the most total trades
+        counts = {}
+        for tid in TRADER_IDS:
+            r = supabase.table("trades").select("id", count="exact").eq("trader_id", tid).execute()
+            counts[tid] = r.count or 0
+        fallback_trader = max(counts, key=counts.get) if counts else TRADER_IDS[0]
+
+        alpaca_pairs: dict = {}
+        for ticker, pos in alpaca_by_ticker.items():
+            trader_id = ticker_to_trader.get(ticker, fallback_trader)
+            alpaca_pairs[(trader_id, ticker)] = pos
+
+        all_pairs = set(alpaca_pairs.keys()) | set(db_by_key.keys())
+
+        for (trader_id, ticker) in all_pairs:
+            checked += 1
+            alpaca_pos = alpaca_pairs.get((trader_id, ticker))
+            db_pos = db_by_key.get((trader_id, ticker))
+
+            alpaca_shares = alpaca_pos["shares"] if alpaca_pos else 0
+            db_shares     = int(db_pos["shares"]) if db_pos else 0
+            avg_cost      = float(db_pos["avg_cost"]) if db_pos else (
+                alpaca_pos["avg_entry_price"] if alpaca_pos else 0.0
+            )
+
+            resolution = None
+            notes      = None
+
+            try:
+                if alpaca_pos and db_pos:
+                    if alpaca_shares == db_shares:
+                        continue  # CASE 4: exact match — nothing to do
+                    # CASE 1: share count mismatch
+                    cash_delta = (db_shares - alpaca_shares) * avg_cost
+                    supabase.rpc("reconcile_position", {
+                        "p_trader_id": trader_id,
+                        "p_ticker":    ticker,
+                        "p_shares":    alpaca_shares,
+                        "p_avg_cost":  avg_cost,
+                        "p_cash_delta": cash_delta,
+                    }).execute()
+                    resolution = "corrected"
+                    notes = (
+                        f"DB had {db_shares} shares, Alpaca has {alpaca_shares}; "
+                        f"cash adjusted by ${cash_delta:+,.2f}"
+                    )
+
+                elif alpaca_pos and not db_pos:
+                    # CASE 2: Alpaca position missing from DB
+                    supabase.rpc("reconcile_position", {
+                        "p_trader_id":  trader_id,
+                        "p_ticker":     ticker,
+                        "p_shares":     alpaca_shares,
+                        "p_avg_cost":   alpaca_pos["avg_entry_price"],
+                        "p_cash_delta": 0,
+                    }).execute()
+                    resolution = "position_added"
+                    notes = (
+                        f"Added missing position: {alpaca_shares} shares "
+                        f"@ ${alpaca_pos['avg_entry_price']:.2f}"
+                    )
+
+                elif db_pos and not alpaca_pos:
+                    # CASE 3: DB position not in Alpaca (ghost)
+                    supabase.rpc("remove_ghost_position", {
+                        "p_trader_id": trader_id,
+                        "p_ticker":    ticker,
+                    }).execute()
+                    resolution = "position_removed"
+                    notes = f"Removed ghost position: {db_shares} shares not found in Alpaca"
+
+                if resolution:
+                    supabase.table("reconciliation_log").insert({
+                        "trader_id":     trader_id,
+                        "ticker":        ticker,
+                        "db_shares":     db_shares,
+                        "alpaca_shares": alpaca_shares,
+                        "resolution":    resolution,
+                        "notes":         notes,
+                    }).execute()
+                    corrections += 1
+                    log.info(f"reconcile: {resolution} — {ticker} ({trader_id}): {notes}")
+
+            except Exception as e:
+                log.error(f"reconcile: failed for {ticker} ({trader_id}): {e}")
+                errors += 1
+
+    except Exception as e:
+        log.error(f"reconcile: outer error: {e}")
+        errors += 1
+
+    _last_reconcile_summary = {
+        "checked":     checked,
+        "corrections": corrections,
+        "errors":      errors,
+        "ran_at":      datetime.now(timezone.utc).isoformat(),
+    }
+    log.info(f"reconcile: checked={checked}, corrections={corrections}, errors={errors}")
+    return _last_reconcile_summary
+
+
+# Hourly on the :30 mark — is_market_hours() gates actual execution (8:30am–4pm ET, no holidays)
+scheduler.add_job(
+    run_market_session,
+    IntervalTrigger(hours=1, start_date="2026-01-01 08:30:00", timezone=ET),
+)
+
+# 9:00 AM ET on weekdays — ticker discovery before first trader run
 scheduler.add_job(run_discovery_job, CronTrigger(hour=9, minute=0, day_of_week="mon-fri", timezone=ET))
 
+# 3:45 PM ET on weekdays — flatten all positions before market close
+scheduler.add_job(flatten_all_positions, CronTrigger(hour=15, minute=45, day_of_week="mon-fri", timezone=ET))
 
-@app.on_event("startup")
-async def startup():
-    scheduler.start()
-    log.info("scheduler: started — discovery 09:00, trader runs 10:00, 13:00, 15:30 ET")
+# 4:05 PM ET on weekdays — generate EOD summaries after close
+scheduler.add_job(generate_daily_summaries, CronTrigger(hour=16, minute=5, day_of_week="mon-fri", timezone=ET))
 
-
-@app.on_event("shutdown")
-async def shutdown():
-    scheduler.shutdown(wait=False)
-    log.info("scheduler: shut down")
+# Every 30 minutes 24/7 — reconcile Alpaca vs DB (no market-hours or pause gate)
+scheduler.add_job(reconcile_positions, IntervalTrigger(minutes=30))
 
 
 # ---------------------------------------------------------------------------
@@ -152,6 +538,7 @@ def scheduler_status():
     return {
         "running": scheduler.running,
         "paused": _is_paused(),
+        "market_open": is_market_hours(),
         "next_runs": [t.isoformat() for t in next_runs],
     }
 
@@ -216,6 +603,26 @@ def get_alpaca_positions():
 
 
 # ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def get_latest_prices(tickers: list[str]) -> dict:
+    prices = {}
+    for ticker in tickers:
+        rows = (
+            supabase.table("prices")
+            .select("close")
+            .eq("ticker", ticker)
+            .order("timestamp", desc=True)
+            .limit(1)
+            .execute()
+        )
+        if rows.data:
+            prices[ticker] = float(rows.data[0]["close"])
+    return prices
+
+
+# ---------------------------------------------------------------------------
 # Existing endpoints
 # ---------------------------------------------------------------------------
 
@@ -268,23 +675,12 @@ def get_fund_summary():
     balance_map = {row["trader_id"]: float(row["cash"]) for row in balances.data}
     total_cash = sum(balance_map.get(t, STARTING_CASH) for t in TRADER_IDS)
 
-    positions = supabase.table("portfolio_positions").select("ticker, shares, trader_id").execute()
+    positions = supabase.table("portfolio_positions").select("ticker, shares, avg_cost, trader_id").execute()
     tickers = list({p["ticker"] for p in positions.data})
-    current_prices = {}
-    for ticker in tickers:
-        rows = (
-            supabase.table("prices")
-            .select("close")
-            .eq("ticker", ticker)
-            .order("timestamp", desc=True)
-            .limit(1)
-            .execute()
-        )
-        if rows.data:
-            current_prices[ticker] = float(rows.data[0]["close"])
+    current_prices = get_latest_prices(tickers)
 
     position_value = sum(
-        p["shares"] * current_prices.get(p["ticker"], 0.0)
+        p["shares"] * current_prices.get(p["ticker"], p["avg_cost"])
         for p in positions.data
     )
     total_fund_value = total_cash + position_value
@@ -306,7 +702,7 @@ def get_fund_summary():
     for trader_id in TRADER_IDS:
         cash = balance_map.get(trader_id, STARTING_CASH)
         trader_positions = [p for p in positions.data if p["trader_id"] == trader_id]
-        pos_val = sum(p["shares"] * current_prices.get(p["ticker"], 0.0) for p in trader_positions)
+        pos_val = sum(p["shares"] * current_prices.get(p["ticker"], p["avg_cost"]) for p in trader_positions)
         pnl = (cash + pos_val) - STARTING_CASH
         if best_pnl is None or pnl > best_pnl:
             best_pnl = pnl
@@ -328,28 +724,17 @@ def get_traders():
 
     positions = supabase.table("portfolio_positions").select("ticker, shares, avg_cost, trader_id").execute()
     tickers = list({p["ticker"] for p in positions.data})
-    current_prices = {}
-    for ticker in tickers:
-        rows = (
-            supabase.table("prices")
-            .select("close")
-            .eq("ticker", ticker)
-            .order("timestamp", desc=True)
-            .limit(1)
-            .execute()
-        )
-        if rows.data:
-            current_prices[ticker] = float(rows.data[0]["close"])
+    current_prices = get_latest_prices(tickers)
 
     result = []
     for trader_id in TRADER_IDS:
         cash = balance_map.get(trader_id, STARTING_CASH)
         trader_positions = [p for p in positions.data if p["trader_id"] == trader_id]
-        pos_val = sum(p["shares"] * current_prices.get(p["ticker"], 0.0) for p in trader_positions)
+        pos_val = sum(p["shares"] * current_prices.get(p["ticker"], p["avg_cost"]) for p in trader_positions)
         pnl = (cash + pos_val) - STARTING_CASH
 
-        wins = sum(1 for p in trader_positions if current_prices.get(p["ticker"], 0.0) > p["avg_cost"])
-        losses = sum(1 for p in trader_positions if current_prices.get(p["ticker"], 0.0) < p["avg_cost"])
+        wins = sum(1 for p in trader_positions if current_prices.get(p["ticker"], p["avg_cost"]) > p["avg_cost"])
+        losses = sum(1 for p in trader_positions if current_prices.get(p["ticker"], p["avg_cost"]) < p["avg_cost"])
 
         trade_count_res = (
             supabase.table("trades")
@@ -406,6 +791,56 @@ def get_positions():
             grouped[tid] = []
         grouped[tid].append(pos)
     return grouped
+
+
+@app.get("/traders/{trader_id}/positions")
+def get_trader_positions(trader_id: str):
+    if trader_id not in TRADER_IDS:
+        raise HTTPException(status_code=404, detail=f"Unknown trader_id: {trader_id!r}")
+
+    rows = (
+        supabase.table("portfolio_positions")
+        .select("*")
+        .eq("trader_id", trader_id)
+        .execute()
+    )
+
+    tickers = [p["ticker"] for p in rows.data]
+    price_map = get_latest_prices(tickers)
+
+    positions = []
+    for p in rows.data:
+        ticker       = p["ticker"]
+        shares       = float(p["shares"])
+        avg_cost     = float(p["avg_cost"])
+        stale        = ticker not in price_map
+        current_price = price_map.get(ticker, avg_cost)
+        cost_basis    = round(shares * avg_cost, 2)
+        market_value  = round(shares * current_price, 2)
+        unreal_pnl    = round(market_value - cost_basis, 2)
+        unreal_pct    = round(unreal_pnl / cost_basis * 100, 2) if cost_basis else 0.0
+        positions.append({
+            "ticker":              ticker,
+            "shares":              shares,
+            "avg_cost":            round(avg_cost, 4),
+            "current_price":       round(current_price, 4),
+            "cost_basis":          cost_basis,
+            "market_value":        market_value,
+            "unrealized_pnl":      unreal_pnl,
+            "unrealized_pnl_pct":  unreal_pct,
+            "price_is_stale":      stale,
+        })
+
+    positions.sort(key=lambda x: x["market_value"], reverse=True)
+
+    summary = {
+        "total_cost_basis":    round(sum(p["cost_basis"]   for p in positions), 2),
+        "total_market_value":  round(sum(p["market_value"] for p in positions), 2),
+        "total_unrealized_pnl": round(sum(p["unrealized_pnl"] for p in positions), 2),
+        "position_count":      len(positions),
+    }
+
+    return {"trader_id": trader_id, "positions": positions, "summary": summary}
 
 
 @app.get("/pending")
@@ -557,3 +992,38 @@ def reject_decision(decision_id: int):
     }).eq("id", decision_id).execute()
 
     return {"status": "rejected", "decision_id": decision_id}
+
+
+@app.post("/eod/flatten")
+def trigger_eod_flatten():
+    log.info("eod_flatten: manual trigger via POST /eod/flatten")
+    try:
+        flatten_all_positions()
+        return {"status": "ok"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/eod/summary")
+def trigger_eod_summary():
+    log.info("eod_summary: manual trigger via POST /eod/summary")
+    try:
+        generate_daily_summaries()
+        return {"status": "ok"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/reconciliation/status")
+def reconciliation_status():
+    rows = (
+        supabase.table("reconciliation_log")
+        .select("*")
+        .order("checked_at", desc=True)
+        .limit(20)
+        .execute()
+    )
+    return {
+        "last_run": _last_reconcile_summary,
+        "recent_corrections": rows.data,
+    }

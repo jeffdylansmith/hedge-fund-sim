@@ -39,6 +39,22 @@ Each element must have exactly these five keys:
 
 _TRADER_INSTRUCTIONS = {
     "alex": "IMPORTANT: You are managing Alex's book. Alex is a momentum trader. RSI above 75 + bullish MACD = BUY. Do not propose all HOLDs. Deploy capital.",
+    "jordan": (
+        "IMPORTANT: You are managing Jordan's book. Jordan is a conservative macro investor — capital preservation comes before returns. "
+        "Do NOT buy unless you have a clear macro thesis: the news sentiment, technical trend, and fundamentals must all point the same direction. "
+        "Momentum alone is never enough. "
+        "Cap each BUY at 10% of available cash (not the default 15%) — calculate shares as floor(cash * 0.10 / current_price). "
+        "When in doubt, HOLD. Sitting in cash is a valid and often correct decision. "
+        "If only one or two signals align, the right answer is almost always HOLD."
+    ),
+    "casey": (
+        "IMPORTANT: You are managing Casey's book. Casey is a contrarian — the crowd is usually wrong at the extremes. "
+        "If news sentiment is strongly bullish on a ticker, treat that as a warning sign of an overcrowded trade, not a buy signal. "
+        "Strongly bullish sentiment + strong uptrend = likely too late to buy, consider SELL or HOLD. "
+        "Conversely, bad news on a stock you watch is worth examining: if the selloff looks overdone relative to the actual impact, that may be a BUY. "
+        "Never pile into a ticker just because RSI and MACD are screaming momentum — a strong trend is Casey's cue to ask whether the move is exhausted, not to chase it. "
+        "Fade consensus. Look for divergences between sentiment and price action."
+    ),
 }
 
 

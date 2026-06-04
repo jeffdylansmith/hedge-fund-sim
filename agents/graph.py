@@ -1,5 +1,6 @@
 import json
 import os
+import anthropic
 from datetime import datetime, timezone
 from typing import TypedDict, List, Dict
 from langgraph.graph import StateGraph, START, END
@@ -11,7 +12,7 @@ from agents.news_analyst import analyze_news
 from agents.technical_analyst import analyze_technicals
 from agents.portfolio_manager import decide_portfolio
 from agents.risk_manager import assess_risk
-from agents.trader_config import TraderConfig, get_trader
+from agents.trader_config import TraderConfig, get_trader, TRADERS
 
 ALPACA_API_KEY = os.getenv("ALPACA_API_KEY")
 ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY")
@@ -19,6 +20,8 @@ alpaca_client = (
     TradingClient(ALPACA_API_KEY, ALPACA_SECRET_KEY, paper=True)
     if ALPACA_API_KEY else None
 )
+
+_anthropic_client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
 
 
 class HedgeFundState(TypedDict):
@@ -281,8 +284,16 @@ def vp_check_node(state: HedgeFundState) -> dict:
     return {"trade_proposal": filtered, "vp_verdict": "execute_trade", "errors": errors}
 
 
-def execute_trade_node(state: HedgeFundState) -> dict:
-    errors = list(state.get("errors", []))
+def _execute_trade_logic(
+    state: HedgeFundState,
+    trade_proposal=None,
+    errors=None,
+) -> dict:
+    if errors is None:
+        errors = list(state.get("errors", []))
+    if trade_proposal is None:
+        trade_proposal = state.get("trade_proposal", [])
+
     trader_id = state["trader_id"]
     positions_by_ticker = {p["ticker"]: p for p in state.get("positions", [])}
     now = datetime.now(timezone.utc).isoformat()
@@ -296,7 +307,7 @@ def execute_trade_node(state: HedgeFundState) -> dict:
     )
     if not balance_rows.data:
         errors.append(
-            f"execute_trade: no fund_balance row for trader_id={trader_id!r}, defaulting to $33,333"
+            f"execute_trade: no fund_balance row for trader_id={trader_id!r}, defaulting to $333,333"
         )
         cash = 333_333.33
     else:
@@ -304,7 +315,7 @@ def execute_trade_node(state: HedgeFundState) -> dict:
 
     cash_delta = 0.0
 
-    for trade in state.get("trade_proposal", []):
+    for trade in trade_proposal:
         if trade["action"] == "HOLD":
             continue
 
@@ -399,6 +410,15 @@ def execute_trade_node(state: HedgeFundState) -> dict:
     return {"errors": errors}
 
 
+def execute_trade_node(state: HedgeFundState) -> dict:
+    result = _execute_trade_logic(state)
+    for trade in state.get("trade_proposal", []):
+        if trade["action"] in ("BUY", "SELL"):
+            price = state["current_prices"].get(trade["ticker"], 0.0)
+            generate_trader_reactions(state["trader_id"], {**trade, "price": price}, supabase)
+    return result
+
+
 def human_review_node(state: HedgeFundState) -> dict:
     errors = list(state.get("errors", []))
 
@@ -421,6 +441,130 @@ def human_review_node(state: HedgeFundState) -> dict:
         }).execute()
 
     return {"errors": errors}
+
+
+def route_after_risk(state: HedgeFundState) -> str:
+    recommendation = state.get("risk_assessment", {}).get("recommendation", "")
+    if recommendation == "veto":
+        return "skip_trade"
+    if recommendation == "caution":
+        return "caution_execute"
+    return "execute_trade"
+
+
+def caution_execute_node(state: HedgeFundState) -> dict:
+    errors = list(state.get("errors", []))
+    reduced = []
+    for trade in state.get("trade_proposal", []):
+        if trade["action"] in ("BUY", "SELL") and trade["shares"] > 0:
+            reduced.append({**trade, "shares": max(1, trade["shares"] // 2)})
+        else:
+            reduced.append(trade)
+    errors.append("Risk caution: position size reduced 50% by risk manager")
+    result = _execute_trade_logic(state, trade_proposal=reduced, errors=errors)
+    for trade in reduced:
+        if trade["action"] in ("BUY", "SELL"):
+            price = state["current_prices"].get(trade["ticker"], 0.0)
+            generate_trader_reactions(state["trader_id"], {**trade, "price": price}, supabase)
+    return result
+
+
+def skip_trade_node(state: HedgeFundState) -> dict:
+    errors = list(state.get("errors", []))
+    risk = state.get("risk_assessment", {})
+    flags = risk.get("flags", [])
+    reasoning = "; ".join(flags) if flags else risk.get("rationale", "Risk veto — no details available")
+
+    supabase.table("agent_decisions").insert({
+        "agent_name": "risk_manager",
+        "ticker": None,
+        "action": "risk_veto",
+        "reasoning": reasoning,
+        "confidence": 0,
+        "trader_id": state["trader_id"],
+    }).execute()
+
+    errors.append("Trade vetoed by risk manager")
+    return {"errors": errors}
+
+
+_REACTION_PERSONALITIES = {
+    "alex":   "aggressive momentum trader who buys breakouts and hates missing moves",
+    "jordan": "conservative macro investor who thinks everyone trades too much",
+    "casey":  "contrarian who suspects every consensus trade is a trap",
+}
+
+
+def generate_trader_reactions(executing_trader_id: str, trade: dict, db_client) -> None:
+    try:
+        executing_trader = get_trader(executing_trader_id)
+        reacting_traders = [t for t in TRADERS if t.trader_id != executing_trader_id]
+
+        ticker   = trade.get("ticker", "")
+        action   = trade.get("action", "")
+        shares   = trade.get("shares", 0)
+        price    = trade.get("price", 0.0)
+        reasoning = (trade.get("reasoning") or "")[:100]
+        exec_personality = _REACTION_PERSONALITIES.get(executing_trader_id, "")
+        now = datetime.now(timezone.utc).isoformat()
+
+        for reactor in reacting_traders:
+            try:
+                recent_rows = (
+                    db_client.table("agent_decisions")
+                    .select("action, ticker, reasoning")
+                    .eq("trader_id", reactor.trader_id)
+                    .neq("action", "trader_reaction")
+                    .order("created_at", desc=True)
+                    .limit(3)
+                    .execute()
+                )
+                recent_lines = [
+                    f"{d['action']} {d.get('ticker') or 'portfolio'}: {(d.get('reasoning') or '')[:60]}"
+                    for d in recent_rows.data
+                ]
+                recent_context = "\n".join(recent_lines) if recent_lines else "No recent decisions."
+                reactor_personality = _REACTION_PERSONALITIES.get(reactor.trader_id, "")
+
+                system = (
+                    f"{reactor.name} is a {reactor_personality}. "
+                    "You are reacting to another trader's move. "
+                    "Respond in exactly 1-2 sentences, in character, with NO financial disclaimers, "
+                    "NO hedging language. Be direct, opinionated, and occasionally funny. "
+                    "You can trash talk, give grudging props, or express skepticism. "
+                    "Sound like a real trader on a trading floor, not a compliance officer."
+                )
+                user_content = (
+                    f"You just saw {executing_trader.name} ({exec_personality}) "
+                    f"{action} {shares} shares of {ticker} at ${price:.2f}. "
+                    f"Their reasoning: {reasoning}\n"
+                    f"Your recent moves:\n{recent_context}\n"
+                    "React."
+                )
+
+                msg = _anthropic_client.messages.create(
+                    model="claude-haiku-4-5-20251001",
+                    max_tokens=128,
+                    system=system,
+                    messages=[{"role": "user", "content": user_content}],
+                )
+                reaction = msg.content[0].text.strip()
+
+                db_client.table("agent_decisions").insert({
+                    "agent_name": reactor.name,
+                    "trader_id": reactor.trader_id,
+                    "ticker": ticker,
+                    "action": "trader_reaction",
+                    "reasoning": reaction,
+                    "confidence": None,
+                    "created_at": now,
+                }).execute()
+
+            except Exception as e:
+                print(f"trader_reaction: {reactor.trader_id} failed: {e}")
+
+    except Exception as e:
+        print(f"trader_reaction: outer error: {e}")
 
 
 def run_all_traders() -> None:
@@ -497,15 +641,27 @@ _builder.add_node("portfolio_manager_node", portfolio_manager_node)
 _builder.add_node("risk_manager_node", risk_manager_node)
 _builder.add_node("vp_check_node", vp_check_node)
 _builder.add_node("execute_trade_node", execute_trade_node)
+_builder.add_node("caution_execute_node", caution_execute_node)
+_builder.add_node("skip_trade_node", skip_trade_node)
 
 _builder.add_edge(START, "fetch_data")
 _builder.add_edge("fetch_data", "news_analyst_node")
 _builder.add_edge("news_analyst_node", "technical_analyst_node")
 _builder.add_edge("technical_analyst_node", "portfolio_manager_node")
 _builder.add_edge("portfolio_manager_node", "risk_manager_node")
-_builder.add_edge("risk_manager_node", "vp_check_node")
+_builder.add_conditional_edges(
+    "risk_manager_node",
+    route_after_risk,
+    {
+        "execute_trade":   "vp_check_node",
+        "caution_execute": "caution_execute_node",
+        "skip_trade":      "skip_trade_node",
+    },
+)
 _builder.add_edge("vp_check_node", "execute_trade_node")
 _builder.add_edge("execute_trade_node", END)
+_builder.add_edge("caution_execute_node", END)
+_builder.add_edge("skip_trade_node", END)
 
 graph = _builder.compile()
 

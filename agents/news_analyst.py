@@ -2,6 +2,7 @@ import anthropic
 import json
 import os
 import re
+import sys
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -39,5 +40,15 @@ def analyze_news(news_items: list, persona: str = "") -> dict:
     )
 
     raw = message.content[0].text.strip()
+
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        pass
+
     clean = re.sub(r"^```json\s*|^```\s*|```$", "", raw, flags=re.MULTILINE).strip()
-    return json.loads(clean)
+    try:
+        return json.loads(clean)
+    except json.JSONDecodeError as e:
+        print(f"news_analyst: JSON parse failed: {e}\nRaw response: {raw[:200]}", file=sys.stderr)
+        return {"summary": "Analysis unavailable due to parse error.", "sentiment": "neutral"}
