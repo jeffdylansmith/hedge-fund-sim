@@ -79,23 +79,21 @@ function ActionTag({ action, ticker }) {
 }
 
 export default function Decisions() {
-  const [feed, setFeed] = useState([])
-  const [pending, setPending] = useState([])
-  const [expanded, setExpanded] = useState(new Set())
+  const [feed,         setFeed]         = useState([])
+  const [expanded,     setExpanded]     = useState(new Set())
   const [traderFilter, setTraderFilter] = useState('all')
   const [actionFilter, setActionFilter] = useState('all')
-  const [approving, setApproving] = useState(new Set())
 
   const fetchData = useCallback(async () => {
-    const [f, p] = await Promise.all([
-      fetch(`${API}/feed?limit=50`).then(r => r.json()),
-      fetch(`${API}/pending`).then(r => r.json()),
-    ])
+    const f = await fetch(`${API}/feed?limit=50`).then(r => r.json())
     setFeed(f)
-    setPending(p)
   }, [])
 
-  useEffect(() => { fetchData() }, [fetchData])
+  useEffect(() => {
+    fetchData()
+    const id = setInterval(fetchData, 60_000)
+    return () => clearInterval(id)
+  }, [fetchData])
 
   function toggleExpand(id) {
     setExpanded(prev => {
@@ -103,20 +101,6 @@ export default function Decisions() {
       next.has(id) ? next.delete(id) : next.add(id)
       return next
     })
-  }
-
-  async function handleApprove(id) {
-    setApproving(s => new Set(s).add(id))
-    await fetch(`${API}/approve/${id}`, { method: 'POST' })
-    await fetchData()
-    setApproving(s => { const n = new Set(s); n.delete(id); return n })
-  }
-
-  async function handleReject(id) {
-    setApproving(s => new Set(s).add(id))
-    await fetch(`${API}/reject/${id}`, { method: 'POST' })
-    await fetchData()
-    setApproving(s => { const n = new Set(s); n.delete(id); return n })
   }
 
   const parsedFeed = feed.map(parseFeedItem)
@@ -147,63 +131,6 @@ export default function Decisions() {
         <h1 style={{ fontSize: 20, fontWeight: 700, color: '#e2e8f0', marginBottom: 4 }}>Decisions</h1>
         <p style={{ fontSize: 13, color: '#4a5568' }}>Full agent decision log</p>
       </div>
-
-      {/* ── Pending decisions ── */}
-      {pending.length > 0 && (
-        <div style={{ background: '#161b27', border: '1px solid #744210', borderRadius: 10, padding: 24, marginBottom: 24 }}>
-          <div style={{ fontSize: 11, fontWeight: 600, color: '#f6e05e', marginBottom: 16, textTransform: 'uppercase', letterSpacing: '0.07em' }}>
-            Pending Approval — {pending.length} decision{pending.length !== 1 ? 's' : ''}
-          </div>
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-            {pending.map(p => {
-              const meta = TRADER_META[p.trader_id] ?? { name: p.trader_id, color: '#718096', initial: '?' }
-              const busy = approving.has(p.id)
-              return (
-                <div key={p.id} style={{
-                  display: 'flex', alignItems: 'flex-start', gap: 14,
-                  background: '#0f0f1a', borderRadius: 8, padding: 16,
-                  border: '1px solid #2a2010',
-                }}>
-                  <Avatar meta={meta} />
-                  <div style={{ flex: 1, minWidth: 0 }}>
-                    <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6, flexWrap: 'wrap' }}>
-                      <span style={{ fontWeight: 600, fontSize: 13 }}>{meta.name}</span>
-                      <ActionTag action={p.action} ticker={p.ticker} />
-                      <span style={{ fontSize: 11, color: '#4a5568' }}>
-                        {p.shares} shares @ ${p.price_at_decision?.toFixed(2)}
-                      </span>
-                      <span style={{ fontSize: 11, color: '#2d3748', marginLeft: 'auto' }}>{timeAgo(p.created_at)}</span>
-                    </div>
-                    <div style={{ fontSize: 13, color: '#718096', fontStyle: 'italic', marginBottom: 12 }}>
-                      "{p.reasoning}"
-                    </div>
-                    <div style={{ display: 'flex', gap: 8 }}>
-                      <button
-                        onClick={() => handleApprove(p.id)}
-                        disabled={busy}
-                        style={{
-                          padding: '6px 16px', borderRadius: 6, fontSize: 12, fontWeight: 600, cursor: busy ? 'wait' : 'pointer',
-                          background: busy ? '#1a3320' : '#276749', color: '#68d391',
-                          border: '1px solid #276749', transition: 'all 0.15s',
-                        }}
-                      >Approve</button>
-                      <button
-                        onClick={() => handleReject(p.id)}
-                        disabled={busy}
-                        style={{
-                          padding: '6px 16px', borderRadius: 6, fontSize: 12, fontWeight: 600, cursor: busy ? 'wait' : 'pointer',
-                          background: 'transparent', color: '#fc8181',
-                          border: '1px solid #742a2a', transition: 'all 0.15s',
-                        }}
-                      >Reject</button>
-                    </div>
-                  </div>
-                </div>
-              )
-            })}
-          </div>
-        </div>
-      )}
 
       {/* ── Filters ── */}
       <div style={{ display: 'flex', gap: 24, marginBottom: 16, flexWrap: 'wrap' }}>

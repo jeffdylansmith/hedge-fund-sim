@@ -46,8 +46,14 @@ function parseQuote(decision) {
 export default function Team() {
   const [traders, setTraders] = useState([])
 
-  useEffect(() => {
+  function fetchData() {
     fetch(`${API}/traders`).then(r => r.json()).then(setTraders)
+  }
+
+  useEffect(() => {
+    fetchData()
+    const id = setInterval(fetchData, 60_000)
+    return () => clearInterval(id)
   }, [])
 
   return (

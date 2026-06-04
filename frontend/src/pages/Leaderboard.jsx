@@ -206,8 +206,14 @@ export default function Leaderboard() {
   const [sort,           setSort]           = useState({ key: 'pnl', dir: 'desc' })
   const [modalTraderId,  setModalTraderId]  = useState(null)
 
-  useEffect(() => {
+  function fetchData() {
     fetch(`${API}/traders`).then(r => r.json()).then(setTraders)
+  }
+
+  useEffect(() => {
+    fetchData()
+    const id = setInterval(fetchData, 60_000)
+    return () => clearInterval(id)
   }, [])
 
   function toggleSort(key) {

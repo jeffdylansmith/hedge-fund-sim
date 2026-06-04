@@ -26,7 +26,7 @@ _anthropic_client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
 
 class HedgeFundState(TypedDict):
     ticker: str                    # entry-point ticker passed at invocation
-    trader_id: str                 # used by vp_check to look up fund_balance
+    trader_id: str                 # identifies which trader is running
     watchlist: List[str]           # tickers fetched from watchlist table
     prices: List[Dict]             # all rows from prices table (all tickers)
     news_items: List[Dict]         # all rows from news_items table
@@ -35,8 +35,6 @@ class HedgeFundState(TypedDict):
     news_summary: Dict             # {summary: str, sentiment: bullish|bearish|neutral}
     tech_signals: Dict             # {rsi: {ticker: float}, macd: {ticker: str}, trend: {ticker: str}, signals: str}
     trade_proposal: List[Dict]     # [{ticker, action, shares, reasoning, confidence}]
-    vp_verdict: str                # "execute_trade" or "human_review"
-    vp_threshold: float            # fraction of capital that triggers human review (from TraderConfig)
     trader_persona: str            # prepended to PM system prompt (from TraderConfig)
     news_analyst_persona: str      # prepended to news analyst system prompt (from TraderConfig)
     tech_analyst_persona: str      # prepended to technical analyst system prompt (from TraderConfig)
@@ -248,42 +246,6 @@ def risk_manager_node(state: HedgeFundState) -> dict:
     return {"risk_assessment": result, "errors": errors}
 
 
-def vp_check_node(state: HedgeFundState) -> dict:
-    errors = list(state.get("errors", []))
-
-    balance_rows = (
-        supabase.table("fund_balance")
-        .select("cash")
-        .eq("trader_id", state["trader_id"])
-        .limit(1)
-        .execute()
-    )
-    if not balance_rows.data:
-        errors.append(
-            f"vp_check: no fund_balance row for trader_id={state['trader_id']!r}, defaulting to $333,333"
-        )
-        capital = 333_333.33
-    else:
-        capital = float(balance_rows.data[0]["cash"])
-
-    threshold = capital * state["vp_threshold"]
-
-    filtered = []
-    for trade in state.get("trade_proposal", []):
-        price = state["current_prices"].get(trade["ticker"], 0.0)
-        notional = trade["shares"] * price
-        if notional > threshold:
-            errors.append(
-                f"vp_check: {trade['ticker']} notional ${notional:,.2f} exceeds threshold "
-                f"${threshold:,.2f} — converting to HOLD"
-            )
-            filtered.append({**trade, "action": "HOLD", "shares": 0})
-        else:
-            filtered.append(trade)
-
-    return {"trade_proposal": filtered, "vp_verdict": "execute_trade", "errors": errors}
-
-
 def _execute_trade_logic(
     state: HedgeFundState,
     trade_proposal=None,
@@ -417,30 +379,6 @@ def execute_trade_node(state: HedgeFundState) -> dict:
             price = state["current_prices"].get(trade["ticker"], 0.0)
             generate_trader_reactions(state["trader_id"], {**trade, "price": price}, supabase)
     return result
-
-
-def human_review_node(state: HedgeFundState) -> dict:
-    errors = list(state.get("errors", []))
-
-    for trade in state.get("trade_proposal", []):
-        if trade["action"] == "HOLD":
-            continue
-
-        ticker = trade["ticker"]
-        price = state["current_prices"].get(ticker)
-
-        supabase.table("pending_decisions").insert({
-            "agent_name": "Portfolio Manager",
-            "ticker": ticker,
-            "action": trade["action"],
-            "shares": trade["shares"],
-            "price_at_decision": price,
-            "reasoning": trade.get("reasoning", "")[:500],
-            "status": "pending",
-            "trader_id": state["trader_id"],
-        }).execute()
-
-    return {"errors": errors}
 
 
 def route_after_risk(state: HedgeFundState) -> str:
@@ -585,7 +523,6 @@ def run_all_traders() -> None:
             non_hold = [t for t in result["trade_proposal"] if t["action"] != "HOLD"]
             status = "OK"
             detail = (
-                f"verdict={result['vp_verdict']}  "
                 f"trades={len(result['trade_proposal'])}  "
                 f"non-hold={len(non_hold)}  "
                 f"errors={len(result['errors'])}"
@@ -613,7 +550,6 @@ def run_graph(config: TraderConfig) -> dict:
     initial_state: HedgeFundState = {
         "ticker": "",
         "trader_id": config.trader_id,
-        "vp_threshold": config.vp_threshold,
         "trader_persona": persona,
         "news_analyst_persona": config.news_analyst_persona,
         "tech_analyst_persona": config.tech_analyst_persona,
@@ -625,7 +561,6 @@ def run_graph(config: TraderConfig) -> dict:
         "news_summary": {},
         "tech_signals": {},
         "trade_proposal": [],
-        "vp_verdict": "",
         "risk_assessment": {},
         "errors": [],
     }
@@ -639,7 +574,6 @@ _builder.add_node("news_analyst_node", news_analyst_node)
 _builder.add_node("technical_analyst_node", technical_analyst_node)
 _builder.add_node("portfolio_manager_node", portfolio_manager_node)
 _builder.add_node("risk_manager_node", risk_manager_node)
-_builder.add_node("vp_check_node", vp_check_node)
 _builder.add_node("execute_trade_node", execute_trade_node)
 _builder.add_node("caution_execute_node", caution_execute_node)
 _builder.add_node("skip_trade_node", skip_trade_node)
@@ -653,12 +587,11 @@ _builder.add_conditional_edges(
     "risk_manager_node",
     route_after_risk,
     {
-        "execute_trade":   "vp_check_node",
+        "execute_trade":   "execute_trade_node",
         "caution_execute": "caution_execute_node",
         "skip_trade":      "skip_trade_node",
     },
 )
-_builder.add_edge("vp_check_node", "execute_trade_node")
 _builder.add_edge("execute_trade_node", END)
 _builder.add_edge("caution_execute_node", END)
 _builder.add_edge("skip_trade_node", END)
