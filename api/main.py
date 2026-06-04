@@ -1014,6 +1014,15 @@ def trigger_eod_summary():
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.post("/reconciliation/run")
+def run_reconciliation():
+    log.info("reconciliation: manual trigger via POST /reconciliation/run")
+    try:
+        return reconcile_positions()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.get("/reconciliation/status")
 def reconciliation_status():
     rows = (
