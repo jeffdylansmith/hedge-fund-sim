@@ -389,14 +389,13 @@ def reconcile_positions() -> dict:
         for p in db_rows.data:
             db_by_key[(p["trader_id"], p["ticker"])] = p
 
-        # Map each Alpaca ticker → trader_id via most recent alpaca_submitted trade
+        # Map each Alpaca ticker → trader_id via most recent trade (any alpaca_submitted status)
         ticker_to_trader: dict = {}
         for ticker in alpaca_by_ticker:
             rows = (
                 supabase.table("trades")
                 .select("trader_id")
                 .eq("ticker", ticker)
-                .eq("alpaca_submitted", True)
                 .order("executed_at", desc=True)
                 .limit(1)
                 .execute()
@@ -488,6 +487,7 @@ def reconcile_positions() -> dict:
                     log.info(f"reconcile: {resolution} — {ticker} ({trader_id}): {notes}")
 
             except Exception as e:
+                print(f"Reconciliation error for {ticker}: {type(e).__name__}: {e}")
                 log.error(f"reconcile: failed for {ticker} ({trader_id}): {e}")
                 errors += 1
 
