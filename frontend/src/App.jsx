@@ -4,6 +4,7 @@ import Home from './pages/Home'
 import Leaderboard from './pages/Leaderboard'
 import Decisions from './pages/Decisions'
 import Team from './pages/Team'
+import Chat from './pages/Chat'
 
 export default function App() {
   return (
@@ -15,6 +16,7 @@ export default function App() {
           <Route path="/leaderboard" element={<Leaderboard />} />
           <Route path="/decisions" element={<Decisions />} />
           <Route path="/team" element={<Team />} />
+          <Route path="/chat" element={<Chat />} />
         </Routes>
       </main>
     </div>

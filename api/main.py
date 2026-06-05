@@ -2,6 +2,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
@@ -1196,3 +1197,106 @@ def export_training_data(outcome: str = Query(default=None, description="Filter:
         media_type="application/x-ndjson",
         headers={"Content-Disposition": "attachment; filename=training_data.jsonl"},
     )
+
+
+class ChatRequest(BaseModel):
+    message: str
+    history: list[dict] = []
+
+
+@app.post("/chat/{trader_id}")
+def chat_with_trader(trader_id: str, body: ChatRequest):
+    if trader_id not in TRADER_IDS:
+        raise HTTPException(status_code=404, detail=f"Unknown trader: {trader_id!r}")
+
+    from agents.trader_config import get_trader
+    config = get_trader(trader_id)
+
+    # Fetch context
+    decisions_rows = (
+        supabase.table("agent_decisions")
+        .select("action, ticker, reasoning, created_at")
+        .eq("trader_id", trader_id)
+        .not_.in_("action", ["trader_reaction", "daily_summary"])
+        .order("created_at", desc=True)
+        .limit(10)
+        .execute()
+    )
+    positions_rows = (
+        supabase.table("portfolio_positions")
+        .select("ticker, shares, avg_cost")
+        .eq("trader_id", trader_id)
+        .execute()
+    )
+    balance_rows = (
+        supabase.table("fund_balance")
+        .select("cash")
+        .eq("trader_id", trader_id)
+        .limit(1)
+        .execute()
+    )
+    trades_rows = (
+        supabase.table("trades")
+        .select("action, ticker, shares, price, executed_at")
+        .eq("trader_id", trader_id)
+        .order("executed_at", desc=True)
+        .limit(5)
+        .execute()
+    )
+
+    cash = float(balance_rows.data[0]["cash"]) if balance_rows.data else STARTING_CASH
+
+    positions = positions_rows.data or []
+    if positions:
+        positions_text = "\n".join(
+            f"  {p['ticker']}: {p['shares']} shares @ ${float(p['avg_cost']):.2f} avg"
+            for p in positions
+        )
+    else:
+        positions_text = "  No open positions."
+
+    trades = trades_rows.data or []
+    if trades:
+        trades_text = "\n".join(
+            f"  {t['action'].upper()} {t['shares']} {t['ticker']} @ ${float(t['price']):.2f}"
+            f" ({t['executed_at'][:10]})"
+            for t in trades
+        )
+    else:
+        trades_text = "  No recent trades."
+
+    decisions = decisions_rows.data or []
+    if decisions:
+        decisions_text = "\n".join(
+            f"  [{d['created_at'][:10]}] {d['action']} {d.get('ticker') or 'portfolio'}: "
+            f"{(d.get('reasoning') or '')[:80]}"
+            for d in decisions
+        )
+    else:
+        decisions_text = "  No recent decisions."
+
+    system = (
+        f"{config.personality}\n\n"
+        f"You are {config.name}, a trader at Meridian Capital hedge fund simulation.\n"
+        f"Answer questions in character — be direct, opinionated, and specific.\n"
+        f"Reference your actual positions and recent decisions when relevant.\n"
+        f"Never break character. Never add financial disclaimers.\n"
+        f"Keep responses under 150 words — you're a busy trader, not a professor.\n\n"
+        f"Your current portfolio:\n"
+        f"Cash: ${cash:,.2f}\n"
+        f"Positions:\n{positions_text}\n\n"
+        f"Recent trades:\n{trades_text}\n\n"
+        f"Recent decisions:\n{decisions_text}"
+    )
+
+    messages = list(body.history) + [{"role": "user", "content": body.message}]
+
+    msg = _anthropic_client.messages.create(
+        model="claude-haiku-4-5-20251001",
+        max_tokens=256,
+        system=system,
+        messages=messages,
+    )
+    reply = msg.content[0].text.strip()
+
+    return {"trader_id": trader_id, "name": config.name, "reply": reply}

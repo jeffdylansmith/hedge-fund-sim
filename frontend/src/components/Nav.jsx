@@ -5,6 +5,7 @@ const links = [
   { to: '/leaderboard', label: 'Leaderboard' },
   { to: '/decisions', label: 'Decisions' },
   { to: '/team', label: 'Team' },
+  { to: '/chat', label: 'Chat' },
 ]
 
 export default function Nav() {
