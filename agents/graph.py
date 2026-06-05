@@ -13,6 +13,7 @@ from agents.technical_analyst import analyze_technicals
 from agents.portfolio_manager import decide_portfolio
 from agents.risk_manager import assess_risk
 from agents.trader_config import TraderConfig, get_trader, TRADERS
+from agents.fundamental_analyst import analyze_fundamentals
 
 ALPACA_API_KEY = os.getenv("ALPACA_API_KEY")
 ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY")
@@ -39,6 +40,8 @@ class HedgeFundState(TypedDict):
     news_analyst_persona: str      # prepended to news analyst system prompt (from TraderConfig)
     tech_analyst_persona: str      # prepended to technical analyst system prompt (from TraderConfig)
     risk_assessment: Dict          # {risk_score: int 1-10, concentration_pct: float, flags: list[str], recommendation: str, rationale: str}
+    fundamental_scores: List[Dict] # rows from fundamental_scores table
+    trader_memory: str             # formatted performance memory string from memory.py
     errors: List[str]              # accumulated non-fatal errors from any node
 
 
@@ -76,13 +79,47 @@ def fetch_data(state: HedgeFundState) -> dict:
         .execute()
     )
 
+    fundamental_rows = (
+        supabase.table("fundamental_scores")
+        .select("*")
+        .in_("ticker", tickers)
+        .execute()
+    )
+
+    from agents.memory import get_trader_memory
+    trader_memory = get_trader_memory(state["trader_id"], supabase)
+
     return {
         "watchlist": tickers,
         "prices": all_prices,
         "current_prices": current_prices,
         "news_items": news_rows.data,
         "positions": positions_rows.data,
+        "fundamental_scores": fundamental_rows.data,
+        "trader_memory": trader_memory,
     }
+
+
+def fundamental_analyst_node(state: HedgeFundState) -> dict:
+    scores = state.get("fundamental_scores", [])
+    if not scores:
+        return {}
+
+    sorted_scores = sorted(scores, key=lambda x: x.get("score", 0), reverse=True)
+    top5 = sorted_scores[:5]
+    bottom5 = sorted_scores[-5:]
+
+    top_str = ", ".join(
+        f"{s['ticker']}({s.get('score', 0)}/10 {s.get('verdict', '')})" for s in top5
+    )
+    bottom_str = ", ".join(
+        f"{s['ticker']}({s.get('score', 0)}/10 {s.get('verdict', '')})" for s in bottom5
+    )
+    context = f"\n\nFundamental scores:\nTop picks: {top_str}\nAvoid: {bottom_str}"
+
+    news_summary = dict(state.get("news_summary", {}))
+    news_summary["summary"] = news_summary.get("summary", "") + context
+    return {"news_summary": news_summary}
 
 
 def news_analyst_node(state: HedgeFundState) -> dict:
@@ -164,6 +201,7 @@ def portfolio_manager_node(state: HedgeFundState) -> dict:
             cash=cash,
             trader_persona=state.get("trader_persona", ""),
             trader_id=state["trader_id"],
+            trader_memory=state.get("trader_memory", ""),
         )
     except Exception as e:
         errors.append(f"portfolio_manager failed: {e}")
@@ -562,6 +600,8 @@ def run_graph(config: TraderConfig) -> dict:
         "tech_signals": {},
         "trade_proposal": [],
         "risk_assessment": {},
+        "fundamental_scores": [],
+        "trader_memory": "",
         "errors": [],
     }
     return graph.invoke(initial_state)
@@ -570,6 +610,7 @@ def run_graph(config: TraderConfig) -> dict:
 _builder = StateGraph(HedgeFundState)
 
 _builder.add_node("fetch_data", fetch_data)
+_builder.add_node("fundamental_analyst_node", fundamental_analyst_node)
 _builder.add_node("news_analyst_node", news_analyst_node)
 _builder.add_node("technical_analyst_node", technical_analyst_node)
 _builder.add_node("portfolio_manager_node", portfolio_manager_node)
@@ -579,7 +620,8 @@ _builder.add_node("caution_execute_node", caution_execute_node)
 _builder.add_node("skip_trade_node", skip_trade_node)
 
 _builder.add_edge(START, "fetch_data")
-_builder.add_edge("fetch_data", "news_analyst_node")
+_builder.add_edge("fetch_data", "fundamental_analyst_node")
+_builder.add_edge("fundamental_analyst_node", "news_analyst_node")
 _builder.add_edge("news_analyst_node", "technical_analyst_node")
 _builder.add_edge("technical_analyst_node", "portfolio_manager_node")
 _builder.add_edge("portfolio_manager_node", "risk_manager_node")

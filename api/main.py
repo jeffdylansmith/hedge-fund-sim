@@ -1,6 +1,7 @@
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
@@ -267,6 +268,40 @@ def run_discovery_job() -> None:
         log.info("discovery: ticker discovery complete")
     except Exception as e:
         log.error(f"discovery: ticker discovery failed: {e}")
+
+
+def run_fundamental_analysis() -> None:
+    try:
+        rows = supabase.table("watchlist").select("ticker").execute()
+        tickers = [r["ticker"] for r in rows.data]
+        if not tickers:
+            log.info("fundamental analysis: watchlist empty, skipping")
+            return
+
+        from agents.fundamental_analyst import analyze_fundamentals
+        results = analyze_fundamentals(tickers)
+
+        now = datetime.now(timezone.utc).isoformat()
+        for ticker, data in results.items():
+            supabase.table("fundamental_scores").upsert({
+                "ticker":         ticker,
+                "score":          data["score"],
+                "verdict":        data["verdict"],
+                "thesis":         data["thesis"],
+                "pe_ratio":       data["pe_ratio"],
+                "pb_ratio":       data["pb_ratio"],
+                "debt_to_equity": data["debt_to_equity"],
+                "revenue_growth": data["revenue_growth"],
+                "profit_margin":  data["profit_margin"],
+                "free_cash_flow": data["free_cash_flow"],
+                "market_cap":     data["market_cap"],
+                "sector":         data["sector"],
+                "analyzed_at":    now,
+            }, on_conflict="ticker").execute()
+
+        log.info(f"fundamental analysis: {len(results)} tickers scored")
+    except Exception as e:
+        log.error(f"fundamental analysis: failed: {e}")
 
 
 def flatten_all_positions() -> None:
@@ -629,6 +664,9 @@ scheduler.add_job(
 
 # 9:00 AM ET on weekdays — ticker discovery before first trader run
 scheduler.add_job(run_discovery_job, CronTrigger(hour=9, minute=0, day_of_week="mon-fri", timezone=ET))
+
+# 9:30 AM ET on weekdays — fundamental analysis after discovery
+scheduler.add_job(run_fundamental_analysis, CronTrigger(hour=9, minute=30, day_of_week="mon-fri", timezone=ET))
 
 # 3:45 PM ET on weekdays — flatten all positions before market close
 scheduler.add_job(flatten_all_positions, CronTrigger(hour=15, minute=45, day_of_week="mon-fri", timezone=ET))
@@ -1013,3 +1051,148 @@ def reconciliation_status():
         "last_run": _last_reconcile_summary,
         "recent_corrections": rows.data,
     }
+
+
+@app.get("/fundamentals")
+def get_fundamentals():
+    result = (
+        supabase.table("fundamental_scores")
+        .select("*")
+        .order("score", desc=True)
+        .execute()
+    )
+    return result.data
+
+
+@app.post("/fundamentals/run")
+def trigger_fundamental_analysis():
+    log.info("fundamental analysis: manual trigger via POST /fundamentals/run")
+    try:
+        run_fundamental_analysis()
+        return {"status": "ok"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+_TRADER_PERSONALITIES = {
+    "alex":   "aggressive momentum trader who buys breakouts and hates missing moves",
+    "jordan": "conservative macro investor who thinks everyone trades too much",
+    "casey":  "contrarian who suspects every consensus trade is a trap",
+}
+
+
+@app.get("/training/export")
+def export_training_data(outcome: str = Query(default=None, description="Filter: profitable|unprofitable|open")):
+    # Fetch all portfolio_review decisions (reasoning is a JSON array of trade objects)
+    reviews = (
+        supabase.table("agent_decisions")
+        .select("trader_id, reasoning, created_at")
+        .eq("action", "portfolio_review")
+        .order("created_at")
+        .execute()
+    )
+
+    # Fetch all trades for outcome lookup
+    all_trades = supabase.table("trades").select("trader_id, ticker, action, price, executed_at").order("executed_at").execute()
+    trades_list = all_trades.data or []
+
+    # Index buy trades: (trader_id, ticker) → list of {price, executed_at}
+    buys_index: dict = {}
+    sells_index: dict = {}
+    for t in trades_list:
+        key = (t["trader_id"], t["ticker"])
+        if t["action"] == "buy":
+            buys_index.setdefault(key, []).append(t)
+        elif t["action"] == "sell":
+            sells_index.setdefault(key, []).append(t)
+
+    examples = []
+    for review in (reviews.data or []):
+        trader_id = review["trader_id"]
+        created_at = review["created_at"]
+        personality = _TRADER_PERSONALITIES.get(trader_id, "unknown")
+
+        try:
+            decisions = json.loads(review["reasoning"])
+        except (json.JSONDecodeError, TypeError):
+            continue
+
+        if not isinstance(decisions, list):
+            continue
+
+        for decision in decisions:
+            if not isinstance(decision, dict):
+                continue
+            action = str(decision.get("action", "")).upper()
+            if action not in ("BUY", "SELL"):
+                continue
+
+            ticker = str(decision.get("ticker", "")).upper()
+            reasoning = str(decision.get("reasoning", ""))[:200]
+            confidence = decision.get("confidence")
+
+            # Determine outcome for BUY decisions
+            trade_outcome = "open"
+            if action == "BUY":
+                key = (trader_id, ticker)
+                # Find the buy price from trades around the same time
+                buy_price = None
+                for b in buys_index.get(key, []):
+                    if b["executed_at"] >= created_at:
+                        buy_price = float(b["price"])
+                        buy_at = b["executed_at"]
+                        break
+
+                if buy_price is not None:
+                    # Find a subsequent sell
+                    for s in sells_index.get(key, []):
+                        if s["executed_at"] > buy_at:
+                            sell_price = float(s["price"])
+                            trade_outcome = "profitable" if sell_price > buy_price else "unprofitable"
+                            break
+
+            example = {
+                "instruction": (
+                    f"You are {trader_id} with personality: {personality}. "
+                    f"Market context: not available. "
+                    f"Technical signals for {ticker}: not available. "
+                    f"Current portfolio: approximated from trade history. "
+                    f"Available cash: not available. "
+                    f"Should you BUY, SELL, or HOLD {ticker}?"
+                ),
+                "response": f"{action} {ticker}. {reasoning}",
+                "metadata": {
+                    "trader_id": trader_id,
+                    "ticker": ticker,
+                    "outcome": trade_outcome,
+                    "confidence": confidence,
+                    "created_at": created_at,
+                },
+            }
+            examples.append(example)
+
+    if outcome:
+        examples = [e for e in examples if e["metadata"]["outcome"] == outcome]
+
+    outcome_counts = {"profitable": 0, "unprofitable": 0, "open": 0}
+    for e in examples:
+        o = e["metadata"]["outcome"]
+        if o in outcome_counts:
+            outcome_counts[o] += 1
+
+    header = json.dumps({
+        "total": len(examples),
+        "outcome_breakdown": outcome_counts,
+        "filter": outcome,
+    })
+
+    def generate_jsonl():
+        yield f"# {header}\n"
+        for ex in examples:
+            yield json.dumps(ex) + "\n"
+
+    return StreamingResponse(
+        generate_jsonl(),
+        media_type="application/x-ndjson",
+        headers={"Content-Disposition": "attachment; filename=training_data.jsonl"},
+    )

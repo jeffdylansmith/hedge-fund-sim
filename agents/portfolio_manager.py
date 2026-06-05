@@ -6,7 +6,61 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# LLM Provider configuration
+# LLM_PROVIDER=claude  (default) — Anthropic Claude Haiku
+# LLM_PROVIDER=groq    — Groq hosted Llama 3.1 8B (free tier)
+# LLM_PROVIDER=ollama  — Local ollama instance (Mac Mini, etc.)
+#   Set OLLAMA_HOST to your Mac Mini's Tailscale IP:
+#   OLLAMA_HOST=http://100.x.x.x:11434
+#   OLLAMA_MODEL=llama3.1:8b (or any model you have pulled)
+LLM_PROVIDER = os.getenv("LLM_PROVIDER", "claude")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
+GROQ_MODEL = "llama-3.1-8b-instant"
+OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.1:8b")
+
 _client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+
+
+def _call_llm(system: str, user: str, max_tokens: int = 500) -> str:
+    if LLM_PROVIDER == "ollama":
+        import requests
+        response = requests.post(
+            f"{OLLAMA_HOST}/api/chat",
+            json={
+                "model": OLLAMA_MODEL,
+                "messages": [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ],
+                "stream": False,
+                "options": {"num_predict": max_tokens},
+            },
+            timeout=120,
+        )
+        response.raise_for_status()
+        return response.json()["message"]["content"]
+    elif LLM_PROVIDER == "groq" and GROQ_API_KEY:
+        from groq import Groq
+        client = Groq(api_key=GROQ_API_KEY)
+        response = client.chat.completions.create(
+            model=GROQ_MODEL,
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            max_tokens=max_tokens,
+        )
+        return response.choices[0].message.content
+    else:
+        msg = _client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=max_tokens,
+            system=system,
+            messages=[{"role": "user", "content": user}],
+        )
+        return msg.content[0].text
+
 
 _SYSTEM_BASE = """You are a disciplined portfolio manager with 20 years of experience running a \
 mid-sized hedge fund. You have lived through the 2008 crash and 2020 pandemic. Your number \
@@ -67,6 +121,7 @@ def decide_portfolio(
     cash: float = 0.0,
     trader_persona: str = "",
     trader_id: str = "",
+    trader_memory: str = "",
 ) -> list:
     max_per_trade = cash * 0.15
     sizing_rules = (
@@ -80,6 +135,8 @@ def decide_portfolio(
     system = _SYSTEM_BASE.format(sizing_rules=sizing_rules)
     if trader_instruction:
         system = system.rstrip() + f"\n\n{trader_instruction}\n"
+    if trader_memory:
+        system = system.rstrip() + f"\n\nYOUR PERFORMANCE MEMORY:\n{trader_memory}\n"
 
     positions_text = (
         "\n".join(
@@ -110,13 +167,7 @@ Return a JSON array with one decision object per ticker in the watchlist."""
 
     effective_system = f"{trader_persona}\n\n{system}" if trader_persona else system
 
-    msg = _client.messages.create(
-        model="claude-haiku-4-5-20251001",
-        max_tokens=1024,
-        system=effective_system,
-        messages=[{"role": "user", "content": user_content}],
-    )
-    raw = msg.content[0].text.strip()
+    raw = _call_llm(effective_system, user_content, max_tokens=1024).strip()
 
     # Attempt 1: parse raw response
     try:
