@@ -11,6 +11,7 @@ from supabase import create_client
 from dotenv import load_dotenv
 from datetime import datetime, date, time, timezone
 import anthropic
+import resend
 import pytz
 import logging
 import os
@@ -27,6 +28,14 @@ async def lifespan(app: FastAPI):
     log.info(
         "scheduler: started — discovery 09:00, trader runs 08:30–16:00, "
         "EOD flatten 15:45, EOD summary 16:05, reconcile every 30min ET"
+    )
+    send_alert(
+        subject="Meridian Capital — App Started",
+        body=(
+            f"The app restarted successfully at "
+            f"{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}.\n\n"
+            f"Scheduler is running. Next market session begins at 8:30am ET."
+        ),
     )
     try:
         summary = reconcile_positions()
@@ -75,6 +84,9 @@ TRADER_IDS = ["alex", "jordan", "casey"]
 ET = pytz.timezone("America/New_York")
 _last_reconcile_summary: dict = {}
 
+resend.api_key = os.getenv("RESEND_API_KEY", "")
+ALERT_EMAIL = os.getenv("ALERT_EMAIL_ADDRESS", "")
+
 _NYSE_HOLIDAYS_2026 = {
     date(2026, 1,  1),   # New Year's Day
     date(2026, 1, 19),   # MLK Day
@@ -97,6 +109,48 @@ def is_market_hours() -> bool:
         return False
     t = now_et.time()
     return time(8, 30) <= t <= time(16, 0)
+
+
+def send_alert(subject: str, body: str) -> None:
+    if not resend.api_key or not ALERT_EMAIL:
+        return
+    try:
+        resend.Emails.send({
+            "from": "Meridian Capital <onboarding@resend.dev>",
+            "to": ALERT_EMAIL,
+            "subject": subject,
+            "text": body,
+        })
+        log.info(f"alert sent: {subject}")
+    except Exception as e:
+        log.warning(f"alert failed: {e}")
+
+
+def check_fund_health() -> None:
+    balances = supabase.table("fund_balance").select("cash").execute()
+    total_cash = sum(float(r["cash"]) for r in balances.data)
+
+    positions = supabase.table("portfolio_positions").select("ticker, shares").execute()
+    tickers = list({p["ticker"] for p in positions.data})
+    price_map = get_latest_prices(tickers)
+    position_value = sum(
+        float(p["shares"]) * price_map.get(p["ticker"], 0.0)
+        for p in positions.data
+    )
+    total_fund_value = total_cash + position_value
+
+    if total_fund_value < 500_000:
+        drawdown_pct = (1_000_000 - total_fund_value) / 1_000_000 * 100
+        send_alert(
+            subject="⚠️ Meridian Capital — Fund Drawdown Alert",
+            body=(
+                f"Total fund value has dropped below $500,000.\n\n"
+                f"Current value: ${total_fund_value:,.2f}\n"
+                f"Starting capital: $1,000,000.00\n"
+                f"Drawdown: {drawdown_pct:.1f}%\n\n"
+                f"Log in to review: https://hedge-fund-sim.vercel.app"
+            ),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -193,6 +247,11 @@ def run_market_session() -> None:
     except Exception as e:
         log.error(f"scheduler: market session failed: {e}")
         _log_run("error", str(e)[:500])
+
+    try:
+        check_fund_health()
+    except Exception as e:
+        log.warning(f"fund health check failed: {e}")
 
 
 def run_discovery_job() -> None:
@@ -537,6 +596,20 @@ def reconcile_positions() -> dict:
     except Exception as e:
         log.error(f"reconcile: outer error: {e}")
         errors += 1
+
+    if corrections > 0:
+        send_alert(
+            subject="🔧 Meridian Capital — Reconciliation Corrections Made",
+            body=(
+                f"Reconciliation found and corrected {corrections} discrepancies "
+                f"between the database and Alpaca.\n\n"
+                f"Run at: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}\n"
+                f"Positions checked: {checked}\n"
+                f"Corrections made: {corrections}\n\n"
+                f"This was handled automatically. "
+                f"Review at: https://hedge-fund-sim.vercel.app"
+            ),
+        )
 
     _last_reconcile_summary = {
         "checked":     checked,
