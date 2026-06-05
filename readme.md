@@ -1,256 +1,237 @@
 # Meridian Capital — AI Hedge Fund Simulation
 
-A multi-agent AI system that simulates a hedge fund with three competing traders, each with a distinct investment personality, running on real market data. Agents analyze news sentiment, compute technical signals, assess risk, and propose trades — automatically, three times a day, against a live paper trading account.
+A multi-agent AI system that runs a simulated hedge fund with three competing traders, each making independent buy/sell decisions on a live watchlist using real market data. The interesting part isn't the trading — it's the architecture: a typed LangGraph state machine orchestrates seven specialized agent nodes, each backed by Claude Haiku, with conditional routing at the risk management layer, Alpaca paper trading for execution, and a Supabase persistence layer with atomic RPCs for position management. The traders aren't clones of each other: Alex is a momentum chaser who hates sitting in cash, Jordan is a capital-preservation macro investor who mostly HOLDs, and Casey is a contrarian who fades consensus moves. They react to each other's trades in character, generate EOD journal entries, and adapt their behavior over time through a RAG memory layer that injects recent P&L history into the decision context.
 
-**[Live Demo →](https://hedge-fund-sim.vercel.app)**
+## Live Demo
+
+| | |
+|---|---|
+| **Frontend** | https://hedge-fund-sim.vercel.app |
+| **API** | https://hedge-fund-sim-production.up.railway.app |
+| **API Docs** | https://hedge-fund-sim-production.up.railway.app/docs |
 
 ---
 
-## What it does
+## Architecture Overview
 
-Every trading session, the system:
+```
+┌─────────────────────────────────────────────────────────┐
+│                     Data Ingestion                       │
+│  yfinance (OHLCV + fundamentals) · NewsAPI · Alpaca      │
+│  Discovery: yfinance screener → watchlist (9am daily)    │
+└────────────────────────┬────────────────────────────────┘
+                         │
+                         ▼
+┌─────────────────────────────────────────────────────────┐
+│               LangGraph State Machine                    │
+│                                                         │
+│  fetch_data ──► fundamental_analyst                     │
+│                      │                                  │
+│                      ▼                                  │
+│               news_analyst                              │
+│                      │                                  │
+│                      ▼                                  │
+│            technical_analyst                            │
+│                      │                                  │
+│                      ▼                                  │
+│           portfolio_manager ◄── RAG memory              │
+│                      │                                  │
+│                      ▼                                  │
+│              risk_manager                               │
+│                   /  |  \                               │
+│                  /   |   \                              │
+│           veto  /  caution \ proceed                    │
+│               /       |     \                           │
+│        skip_trade  caution_  execute_trade              │
+│                    execute                              │
+│                       │                                 │
+│                       ▼                                 │
+│              Alpaca paper execution                     │
+│              Supabase persistence                       │
+│              Cross-trader reactions                     │
+└─────────────────────────────────────────────────────────┘
+                         │
+                         ▼
+┌─────────────────────────────────────────────────────────┐
+│                  React Frontend                          │
+│  Live feed · Leaderboard · Position detail · Chat UI    │
+└─────────────────────────────────────────────────────────┘
+```
 
-1. Screens the market for the day's biggest movers and most-active names, bootstraps 30 days of price history on new tickers, and rotates stale ones out after 14 days
-2. Runs a seven-node LangGraph pipeline for each trader across every watched ticker — news sentiment, technical analysis, trade proposal, risk assessment, position sizing, and execution — each agent tuned to that trader's investment style
-3. Routes all trades directly to execution; VP circuit breaker converts oversized positions to HOLD rather than blocking execution
-4. Submits approved orders to an Alpaca paper trading account and logs every decision with full reasoning for audit
+The graph runs once per hour per trader during market hours. Each run is a full traversal: fresh data fetch, seven agent nodes, conditional execution routing, Alpaca order submission, and DB writes — all within a single typed state object that flows through the graph.
+
+---
+
+## The Three Traders
+
+| Trader | Strategy | Risk Tolerance | VP Threshold | Defining Behavior |
+|--------|----------|----------------|--------------|-------------------|
+| **Alex** | Aggressive momentum | High — accepts large drawdowns for outsized returns | 0.5 | RSI > 75 + bullish MACD = BUY. Missing a move is worse than being wrong. Hates sitting in cash. |
+| **Jordan** | Conservative macro | Low — capital preservation above all | 0.3 | Requires news sentiment, technicals, and fundamentals to align before deploying capital. Default answer is HOLD. |
+| **Casey** | Contrarian | Medium — buys fear, sells greed, sizes carefully | 0.5 | Treats strong bullish consensus as a warning sign. Fades momentum extremes. Looks for price/sentiment divergences. |
+
+Each trader runs through the same LangGraph pipeline but with different system prompt personas injected at every node — the news analyst, technical analyst, and portfolio manager all receive trader-specific framing that shapes how they interpret signals.
+
+---
+
+## Agent Pipeline
+
+### fetch_data
+Pulls the full state needed for a trading decision in one pass: OHLCV price history (48 hourly candles per ticker) from Supabase, current positions and cash balance for the active trader, the last 20 news headlines, pre-scored fundamental data from the `fundamental_scores` table, and the trader's RAG memory string. All downstream nodes read from this state — no agent makes its own DB calls.
+
+### Fundamental Analyst
+Runs as a daily batch job at 9:30am ET rather than inside the per-trader graph. For each watchlist ticker, it fetches `yf.Ticker(ticker).info`, extracts ten fundamental fields (PE, PB, D/E, revenue growth, earnings growth, FCF, profit margin, market cap, sector, forward PE), and computes a 0–10 score in Python using explicit threshold rules — no LLM involved in the scoring. Claude Haiku is then called once with all tickers' pre-computed data to assign verdicts (`strong_buy` through `avoid`) and one-sentence theses. Results are upserted to `fundamental_scores` and injected into the graph state as context the portfolio manager can see.
+
+### News Analyst
+Receives the last 20 headlines from NewsAPI (pre-loaded into Supabase by the ingestion layer) and returns a structured JSON object with a market summary and a `bullish|bearish|neutral` sentiment tag. The prompt persona varies per trader — Jordan's news analyst applies a skeptical macro lens; Alex's flags momentum catalysts and ignores litigation noise; Casey's surfaces what the consensus might be getting wrong.
+
+### Technical Analyst
+Computes RSI(14), MACD(12/26/9), SMA(10), and SMA(20) in Python using pandas directly on the price rows pulled from Supabase — no external TA library. The pre-computed indicator values are then sent to Claude Haiku for synthesis into a structured JSON object with per-ticker signals and a human-readable summary. This two-step approach (Python math → LLM interpretation) keeps the numbers accurate while letting the model do the natural-language reasoning.
+
+### Portfolio Manager
+The decision-making core. Receives the full context — news summary, technical signals, fundamental scores (injected into the news summary as a context block by `fundamental_analyst_node`), current positions, cash balance, and the trader's RAG memory string — and returns a JSON array with one `BUY|SELL|HOLD` decision per watchlist ticker, including share count, one-sentence reasoning, and a confidence float. Position sizing is pre-calculated in Python (`floor(cash * 0.15 / price)`) and included in the system prompt to prevent the LLM from hallucinating nonsensical quantities. Supports three inference backends via `LLM_PROVIDER` env var: Claude Haiku (production), Groq-hosted Llama 3.1 8B (experimentation), and local ollama (Mac Mini or any host reachable via Tailscale).
+
+### Risk Manager
+Evaluates the portfolio manager's proposal before any capital is deployed. Pre-computes concentration percentage in Python, then passes the full proposal and portfolio state to Claude Haiku for risk assessment. Returns a score (1–10), specific flags (overbought conditions, insufficient cash reserve, sentiment contradiction), and a three-way routing recommendation. The graph uses conditional edges to route to one of three nodes: `execute_trade` (proceed as proposed), `caution_execute` (cut position sizes in half before executing), or `skip_trade` (veto and log the reasoning). The risk manager is the only place in the pipeline where the graph can branch — it acts as a circuit breaker rather than a rubber stamp.
+
+### Cross-Trader Reactions
+After any executed trade, the other two traders are shown what happened and generate in-character one-to-two sentence reactions using their own personality prompts. These are logged to `agent_decisions` with `action = "trader_reaction"` and surface in the live feed — giving the simulation a floor-banter quality that makes the activity log readable.
+
+---
+
+## Key Architectural Decisions
+
+**1. LangGraph over CrewAI**
+
+LangGraph's explicit typed state and conditional edges were the deciding factor. `HedgeFundState` is a `TypedDict` — every node declares what it reads and what it writes, which makes the data flow auditable and prevents the kind of silent context mutation that plagues agent frameworks built on shared mutable dicts. The conditional routing after `risk_manager_node` — three distinct execution paths with different economic outcomes — would require significant workaround in frameworks that only support linear or hierarchical agent chains. LangGraph treats routing as a first-class concern.
+
+**2. Structured output validation**
+
+No agent's output is trusted as-is. Every LLM response goes through a two-attempt parse: raw JSON first, then markdown-fence-stripped retry. If both fail, the node returns a safe fallback and appends to `state["errors"]` — the graph continues rather than crashing. Beyond parsing, the portfolio manager node validates each trade object against a required key set and silently drops any phantom SELLs for tickers the trader doesn't actually hold. The LLM's job is reasoning; the code's job is enforcement.
+
+**3. Risk manager as circuit breaker**
+
+The three-path routing — proceed, caution, veto — changes the economic outcome meaningfully. Caution cuts position sizes by 50% before execution. Veto logs the rationale but executes nothing. This isn't cosmetic: a risk manager that only ever says "proceed" is a liability, not a safety layer. The trader-specific `vp_threshold` (0.3 for Jordan, 0.5 for Alex and Casey) controls how the risk manager calibrates its recommendations for each persona.
+
+**4. Supabase RPC for atomic position management**
+
+Position updates — buying, selling, adjusting share counts, modifying cash balances — use Supabase RPC functions rather than REST API calls. A BUY that decrements cash and increments a position row needs to succeed or fail together; two separate REST calls with a crash in between leaves the fund in an inconsistent state. The reconciliation job (every 30 minutes, 24/7) compares DB positions against Alpaca's truth and corrects drift using the same RPC layer.
+
+**5. RAG memory layer**
+
+Before each market session, `get_trader_memory()` queries the last 30 days of closed trades for the active trader, pairs each SELL with its prior BUY to compute realized P&L, and computes win rate, best/worst tickers, and behavioral patterns (BUY/SELL/HOLD distribution over 14 days). This is formatted into a structured text block and injected into the portfolio manager's system prompt. No vector database, no embeddings — the context window is small enough that a well-formatted string does the job. The practical effect: a trader who has been losing money on tech stocks will see that in their memory and have it available when deciding whether to add to a tech position.
+
+**6. LLM provider abstraction**
+
+A single `LLM_PROVIDER` env var routes the portfolio manager's inference to Claude Haiku (production default), Groq-hosted Llama 3.1 8B (free tier, useful for cost comparison), or a local ollama instance reachable via `OLLAMA_HOST` — which can be a Mac Mini on the same Tailscale network. The abstraction lives in `_call_llm()` and the rest of the pipeline is unaware of which backend is active. This setup also makes the fine-tuning story concrete: export training pairs from `/training/export`, fine-tune with `scripts/finetune.py`, serve the adapter via ollama, point `OLLAMA_HOST` at it.
+
+---
+
+## Scheduling & Automation
+
+All jobs run via APScheduler with `BackgroundScheduler(timezone=ET)`. Market-session jobs gate on `is_market_hours()` which checks weekday, time window (8:30am–4pm ET), and a hardcoded NYSE holiday calendar. A `scheduler_config` table in Supabase provides a runtime pause/unpause toggle without a redeploy.
+
+| Time | Job |
+|------|-----|
+| 9:00am ET, Mon–Fri | Ticker discovery — yfinance screener (`day_gainers`, `most_actives`) → watchlist |
+| 9:30am ET, Mon–Fri | Fundamental analysis — yfinance `.info` fetch + scoring for all watchlist tickers |
+| Every 60min, 8:30am–4pm ET | Market session — full LangGraph run for all three traders |
+| 3:45pm ET, Mon–Fri | EOD flatten — all positions closed at current prices |
+| 4:05pm ET, Mon–Fri | EOD summaries — Claude Haiku generates in-character trading journal entries |
+| Every 30min, 24/7 | Reconciliation — Alpaca positions vs DB, corrects drift via RPC |
+
+---
+
+## Data Sources
+
+| Source | Used For |
+|--------|----------|
+| **yfinance** | OHLCV price history, fundamental data (PE, revenue growth, FCF, etc.), ticker discovery via screener |
+| **NewsAPI** | Market news headlines, ingested to Supabase and served to the news analyst |
+| **Alpaca** | Paper trading order execution, position truth source for reconciliation |
+| **Supabase** | Primary persistence: prices, positions, trades, decisions, fund balances, news, fundamental scores |
+
+---
+
+## ML/AI Engineering Features
+
+**Multi-agent orchestration** — Seven specialized nodes in a directed graph with typed shared state and conditional branching. Each node has a single responsibility; the graph enforces ordering and data flow.
+
+**Three LLM inference backends** — Claude Haiku for production quality, Groq for free-tier Llama 3.1 8B as a cost comparison baseline, and ollama for fully local inference. One env var switches between them with no code changes.
+
+**Training data export** — `GET /training/export` queries all historical `portfolio_review` decisions, parses the JSON reasoning arrays, pairs BUY decisions with subsequent SELL trades to determine outcome (`profitable | unprofitable | open`), and streams the results as JSONL instruction-tuning pairs. Accepts `?outcome=profitable` to export only winning decisions for positive-example fine-tuning.
+
+**LoRA fine-tuning script** — `scripts/finetune.py` loads the exported JSONL, filters by trader if specified, applies the model's chat template, configures LoRA (`r=16, alpha=32, target_modules=["q_proj","v_proj"]`), and trains with `fp16` on an A10G or equivalent. Estimated cost: ~$3–5 on RunPod spot for a few hundred examples. A `--dry-run` flag validates data and prints statistics without requiring a GPU.
+
+**RAG memory** — `agents/memory.py` computes a performance summary from raw trade history (no embeddings, no vector store) and injects it into the portfolio manager's system prompt. Traders with low win rates get a caution nudge; traders on a hot streak are told to stay disciplined. The lessons are rule-based and generated in Python — the LLM receives the output, not the raw data.
+
+**Outcome-supervised training pairs** — Each exported example includes the trader's decision, the reasoning, and the eventual trade outcome. This creates a dataset where the signal isn't just "what did the model say" but "did it work" — enabling outcome-weighted fine-tuning where profitable decisions get more training weight.
 
 ---
 
 ## Stack
 
 | Layer | Technology |
-|---|---|
-| Language | Python 3.11 |
-| Agent orchestration | LangGraph |
-| LLM | Anthropic Claude Haiku (`claude-haiku-4-5-20251001`) |
-| API | FastAPI |
-| Database | Supabase Postgres |
-| Frontend | React + Vite |
-| Scheduling | APScheduler |
-| Paper trading | Alpaca (`alpaca-py`, `paper=True`) |
-| Market data | yfinance |
-| News data | NewsAPI |
-| Frontend hosting | Vercel |
-| Backend hosting | Railway |
+|-------|-----------|
+| **Language** | Python 3.12 (API + agents), JavaScript/React (frontend) |
+| **Agent orchestration** | LangGraph |
+| **LLM** | Anthropic Claude Haiku (production) · Groq Llama 3.1 8B · ollama |
+| **API** | FastAPI + uvicorn |
+| **Database** | Supabase (PostgreSQL + RPC functions) |
+| **Frontend** | React + Vite, React Router, Recharts |
+| **Scheduling** | APScheduler |
+| **Paper trading** | Alpaca Markets API |
+| **Hosting** | Railway (API) · Vercel (frontend) |
+| **Market data** | yfinance · NewsAPI |
 
 ---
 
-## Agent pipeline
+## Running Locally
 
-Each trader runs an independent instance of the same 7-node LangGraph graph. Agents receive data through typed state — no free-text communication between nodes.
-
-```mermaid
-flowchart LR
-    A[fetch_data] --> B[news_analyst]
-    B --> C[technical_analyst]
-    C --> D[portfolio_manager]
-    D --> E[risk_manager]
-    E --> F[vp_check]
-    F --> G[execute_trade]
-```
-
-### Nodes
-
-**`news_analyst`** — calls Claude with recent headlines for a ticker from `news_items`. Returns `{summary, sentiment}`. Persona-aware: Alex's analyst weights momentum catalysts; Jordan's applies a skeptical macro lens; Casey's looks for crowded-trade reversals.
-
-**`technical_analyst`** — computes RSI, MACD, and trend from price history in Python, then passes computed signals to Claude for interpretation. Returns `{rsi, macd, trend, signals}`. Also persona-aware.
-
-**`portfolio_manager`** — receives the full state (news summary, technical signals, current positions, available cash) and proposes a trade. Returns `{ticker, action, shares, reasoning, confidence}`. Two-attempt retry loop with markdown fence stripping on the second attempt.
-
-**`risk_manager`** — computes position concentration in application code from live prices, injects it as a fact into the prompt, and asks Claude to assess risk. Returns `{risk_score, concentration_pct, flags, recommendation, rationale}`. The LLM interprets; the math happens in code.
-
-**`vp_check`** — pure Python. If `trade_value > available_capital × vp_threshold`, converts the trade to HOLD in-place and logs the reason to state errors. Always routes to `execute_trade`. No LLM call.
-
-**`execute_trade`** — writes to Supabase, submits to Alpaca, decrements fund balance. Pre-trade cash check blocks any BUY that would overdraw the account.
-
----
-
-## The three traders
-
-Each trader is a `TraderConfig` instance injected into the same graph. Adding a fourth trader is one dataclass instance and one database row.
-
-| Trader | Style | Risk | VP threshold |
-|---|---|---|---|
-| Alex | Aggressive momentum | High | 50% of capital |
-| Jordan | Conservative macro | Low | 30% of capital |
-| Casey | Contrarian | Medium | 50% of capital |
-
-Personality strings inject into the portfolio manager system prompt. Separate persona strings inject into each analyst's system prompt — so Alex's news analyst weights breakout catalysts while Casey's looks for overcrowded trades on the same raw data.
-
----
-
-## System architecture
-
-```mermaid
-flowchart TD
-    subgraph Ingestion ["Data ingestion (scheduled)"]
-        DT[discover_tickers.py\nyfinance screener, 9 AM ET]
-        FP[fetch_prices.py\nyfinance OHLCV]
-        FN[fetch_news.py\nNewsAPI headlines]
-    end
-
-    subgraph DB ["Supabase Postgres"]
-        WL[(watchlist)]
-        PR[(prices)]
-        NW[(news_items)]
-        AD[(agent_decisions)]
-        TR[(trades)]
-        PD[(pending_decisions)]
-        FB[(fund_balance)]
-        DO[(discovered_opportunities)]
-    end
-
-    subgraph Agents ["LangGraph pipeline (3x daily, per trader)"]
-        G[graph.py\nrun_all_traders]
-        NA[news_analyst]
-        TA[technical_analyst]
-        PM[portfolio_manager]
-        RM[risk_manager]
-        VP[vp_check]
-        ET[execute_trade]
-    end
-
-    subgraph API ["FastAPI — Railway"]
-        EP["/fund/summary\n/traders\n/feed\n/decisions\n/pending\n/approve\n/reject\n/run"]
-    end
-
-    subgraph FE ["React + Vite — Vercel"]
-        HM[Home\ndrama feed]
-        LB[Leaderboard]
-        DC[Decisions\napprove/reject]
-        TM[Meet the team]
-    end
-
-    ALP[Alpaca\npaper account]
-    LLM[Anthropic Claude\nHaiku]
-
-    DT --> WL
-    DT --> PR
-    FP --> PR
-    FN --> NW
-
-    WL --> G
-    PR --> G
-    NW --> G
-
-    G --> NA --> TA --> PM --> RM --> VP --> ET
-
-    NA --> LLM
-    TA --> LLM
-    PM --> LLM
-    RM --> LLM
-
-    ET --> TR
-    ET --> FB
-    ET --> AD
-    RM --> AD
-
-    TR --> API
-    AD --> API
-    PD --> API
-    FB --> API
-
-    API --> FE
-    ET --> ALP
-```
-
----
-
-## Key architectural decisions
-
-### LangGraph over CrewAI
-
-Migrated mid-project after two problems: the portfolio manager was ignoring JSON output instructions (CrewAI agents communicated via free-text strings), and the VP circuit-breaker required conditional routing that CrewAI's sequential process couldn't express. LangGraph gives typed state, explicit conditional edges, and node-level testability. Each node is a plain function — swapping Claude for a different model is a one-line change.
-
-### Structured output pattern
-
-Agent functions never trust LLM output format. Every node calls Claude, receives raw text, parses and validates in application code, strips markdown fences on retry if parsing fails, and appends to `state["errors"]` on second failure. Validation logic lives in code, not in the prompt.
-
-### Computation stays in code
-
-Anything that can be computed deterministically is. RSI, MACD, and trend are computed in Python before being passed to the technical analyst. Position concentration percentage is computed from live prices before being injected into the risk manager prompt. The LLM interprets facts; it doesn't derive them.
-
-### Supabase write pattern
-
-Agent functions are pure — LLM call in, structured dict out. All database writes happen in node wrappers in `graph.py`. This separates side effects from reasoning logic and makes each piece independently testable.
-
-### Per-trader parameterization
-
-Alex, Jordan, and Casey are one graph instantiated three times with different `TraderConfig` objects. The config carries personality strings for the portfolio manager, persona strings for each analyst, risk tolerance, and VP threshold. The behavioral differences between traders emerge entirely from configuration — there is no branching logic in the graph itself.
-
-### Discovery-gated pipeline
-
-Rather than running the full agent pipeline against a fixed static watchlist, a daily screener (yfinance `day_gainers` + `most_actives`) surfaces net-new tickers, filters by market cap and volume, bootstraps 30 days of price history, and expires names after 14 days. This keeps the watchlist fresh without manual curation and bounds compute costs as the universe grows.
-
----
-
-## Frontend
-
-Four pages, polling every 30 seconds:
-
-- **Home** — live agent decision feed, fund stat cards, trader standings, NAV sparkline
-- **Leaderboard** — P&L ranking, mark-to-market portfolio values
-- **Decisions** — full audit trail with agent reasoning, filterable by trader; approve or reject pending trades inline
-- **Meet the team** — trader cards with personality description and most recent decision quote
-
----
-
-## Local setup
-
-**Prerequisites:** Python 3.11, Node 18+
+**Prerequisites:** Python 3.12+, Node 18+, a Supabase project, Anthropic API key.
 
 ```bash
-git clone https://github.com/jeffdylansmith/hedge-fund-sim
+# Clone and set up Python env
+git clone https://github.com/your-username/hedge-fund-sim
 cd hedge-fund-sim
-
-# Python dependencies
 python -m venv venv && source venv/bin/activate
 pip install -r requirements.txt
 
-# Environment variables
-cp .env.example .env
-# Fill in: SUPABASE_URL, SUPABASE_KEY, ANTHROPIC_API_KEY,
-#           ALPACA_API_KEY, ALPACA_SECRET_KEY, NEWS_API_KEY
+# Required env vars — copy to .env
+ANTHROPIC_API_KEY=...
+SUPABASE_URL=...
+SUPABASE_KEY=...
 
-# Run the API
-export PYTHONPATH=$(pwd)
-uvicorn api.main:app --reload
+# Optional
+ALPACA_API_KEY=...
+ALPACA_SECRET_KEY=...
+NEWS_API_KEY=...
+LLM_PROVIDER=claude          # or groq or ollama
+GROQ_API_KEY=...
+OLLAMA_HOST=http://localhost:11434
+OLLAMA_MODEL=llama3.1:8b
 
-# Frontend (separate terminal)
+# Start the API (PYTHONPATH needed for agent imports)
+PYTHONPATH=. uvicorn api.main:app --reload --port 8000
+
+# Start the frontend
 cd frontend
-cp .env.example .env.local
-# Set VITE_API_URL=http://localhost:8000
-npm install && npm run dev
+npm install
+echo "VITE_API_URL=http://localhost:8000" > .env.local
+npm run dev
 ```
 
-**Trigger a manual trading session:**
+To trigger a single trading session manually without waiting for the scheduler:
+
 ```bash
-curl -X POST http://localhost:8000/run
+PYTHONPATH=. python agents/graph.py
 ```
 
 ---
 
-## Project structure
+## What's Next
 
-```
-hedge-fund-sim/
-├── agents/
-│   ├── graph.py               # LangGraph graph, nodes, HedgeFundState, run_all_traders()
-│   ├── news_analyst.py        # News sentiment agent
-│   ├── technical_analyst.py   # RSI, MACD, trend + LLM interpretation
-│   ├── portfolio_manager.py   # Trade proposal with retry loop
-│   ├── risk_manager.py        # Concentration scoring and risk assessment
-│   └── trader_config.py       # TraderConfig dataclass — Alex, Jordan, Casey
-├── ingestion/
-│   ├── discover_tickers.py    # Daily screener — yfinance, filter, bootstrap, TTL
-│   ├── fetch_prices.py        # yfinance → Supabase prices
-│   └── fetch_news.py          # NewsAPI → Supabase news_items
-├── api/
-│   └── main.py                # FastAPI + APScheduler + all endpoints
-├── frontend/
-│   └── src/
-│       └── pages/             # Home, Leaderboard, Decisions, Team
-└── utils/
-    └── db.py                  # Supabase client
-```
+- **Test suite** — pytest coverage for agent nodes with mocked Supabase and LLM responses; property-based tests for the position sizing and risk concentration math
+- **Portfolio value history** — time-series table tracking total fund value per trader per day, enabling proper drawdown charts rather than synthetic sparklines
+- **Reconciliation UI** — surface the reconciliation log in the frontend so drift corrections are visible without querying the API directly
+- **Fine-tuned model evaluation** — A/B test the LoRA-adapted Llama 3.1 8B against Claude Haiku on decision quality and P&L outcome, using the existing training export pipeline as the evaluation dataset
