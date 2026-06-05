@@ -318,10 +318,45 @@ def generate_daily_summaries() -> None:
                 f"{t['action'].upper()} {t['shares']} {t['ticker']} @ ${t['price']:.2f}"
                 for t in trades_rows.data
             ]
-            net_pnl = sum(
-                t["total_value"] if t["action"] == "sell" else -t["total_value"]
-                for t in trades_rows.data
+
+            # ── Pre-compute all P&L figures in Python ────────────────────────
+            sells = [t for t in trades_rows.data if t["action"] == "sell"]
+            buys  = [t for t in trades_rows.data if t["action"] == "buy"]
+
+            total_sell_value = sum(float(t["total_value"]) for t in sells)
+            total_buy_value  = sum(float(t["total_value"]) for t in buys)
+            net_cash_flow    = total_sell_value - total_buy_value
+
+            # Realized P&L: for each sell, find cost basis from most recent prior BUY
+            realized_pnl = 0.0
+            for sell in sells:
+                ticker      = sell["ticker"]
+                sell_price  = float(sell["price"])
+                sell_shares = float(sell["shares"])
+                prior_buy = (
+                    supabase.table("trades")
+                    .select("price")
+                    .eq("trader_id", trader_id)
+                    .eq("ticker", ticker)
+                    .eq("action", "buy")
+                    .lt("executed_at", today_start)
+                    .order("executed_at", desc=True)
+                    .limit(1)
+                    .execute()
+                )
+                cost_basis = float(prior_buy.data[0]["price"]) if prior_buy.data else sell_price
+                realized_pnl += (sell_price - cost_basis) * sell_shares
+
+            # Current cash and true P&L vs starting capital
+            balance_row = (
+                supabase.table("fund_balance")
+                .select("cash")
+                .eq("trader_id", trader_id)
+                .limit(1)
+                .execute()
             )
+            current_cash = float(balance_row.data[0]["cash"]) if balance_row.data else STARTING_CASH
+            actual_pnl   = current_cash - STARTING_CASH
 
             buy_count  = sum(1 for d in decisions_rows.data if d["action"] == "BUY")
             sell_count = sum(1 for d in decisions_rows.data if d["action"] == "SELL")
@@ -333,13 +368,19 @@ def generate_daily_summaries() -> None:
             system = (
                 f"{trader_name} is a {personality}. "
                 "Write your EOD trading journal entry. Max 5 lines. "
-                "Be specific about what you traded and why. Stay in character. No disclaimers."
+                "Be specific about what you traded and why. Stay in character. No disclaimers. "
+                "All P&L figures are pre-computed and provided to you. "
+                "Use these exact numbers — do not recalculate or estimate P&L yourself."
             )
             user_content = (
                 f"Your trades today:\n"
                 + ("\n".join(trade_lines) if trade_lines else "No trades executed today.")
                 + f"\n\nDecisions made: {buy_count} BUY, {sell_count} SELL, {hold_count} HOLD\n"
-                + f"Net P&L today: ${net_pnl:+,.2f}\n\n"
+                + f"Realized P&L on closed positions today: ${realized_pnl:+,.2f}\n"
+                + f"Total value sold: ${total_sell_value:,.2f}\n"
+                + f"Total value bought: ${total_buy_value:,.2f}\n"
+                + f"Current cash balance: ${current_cash:,.2f}\n"
+                + f"True P&L vs starting capital ($333,333.33): ${actual_pnl:+,.2f}\n\n"
                 + "Summarize your day."
             )
 
