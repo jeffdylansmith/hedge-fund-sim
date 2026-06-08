@@ -937,7 +937,8 @@ def get_fund_summary():
 
 @app.get("/fund/history")
 def get_fund_history(days: int = Query(default=7, ge=1, le=30)):
-    since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    since = cutoff.strftime("%Y-%m-%d")
     result = (
         supabase.table("portfolio_value_history")
         .select("recorded_at, total_value, alex_value, jordan_value, casey_value")
