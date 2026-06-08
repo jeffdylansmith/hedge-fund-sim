@@ -939,7 +939,6 @@ def get_fund_summary():
 def get_fund_history(days: int = Query(default=7, ge=1, le=30)):
     cutoff = datetime.now(timezone.utc) - timedelta(days=days)
     since = cutoff.strftime("%Y-%m-%d")
-    log.info(f"fund/history: days={days}, since={since}")
     result = (
         supabase.table("portfolio_value_history")
         .select("recorded_at, total_value, alex_value, jordan_value, casey_value")
@@ -947,8 +946,41 @@ def get_fund_history(days: int = Query(default=7, ge=1, le=30)):
         .order("recorded_at", desc=False)
         .execute()
     )
-    log.info(f"fund/history: got {len(result.data)} rows, data={result.data}")
     return result.data
+
+
+# N+1 queries (one per sell per trader) — acceptable for now; optimize with a join later if needed
+def get_trader_wl(trader_id: str) -> tuple:
+    sells = (
+        supabase.table("trades")
+        .select("ticker, price, shares, executed_at")
+        .eq("trader_id", trader_id)
+        .eq("action", "sell")
+        .order("executed_at", desc=False)
+        .execute()
+    )
+    wins = losses = 0
+    for sell in sells.data:
+        buy = (
+            supabase.table("trades")
+            .select("price")
+            .eq("trader_id", trader_id)
+            .eq("ticker", sell["ticker"])
+            .eq("action", "buy")
+            .lt("executed_at", sell["executed_at"])
+            .order("executed_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+        if not buy.data:
+            continue
+        sell_price = float(sell["price"])
+        buy_price = float(buy.data[0]["price"])
+        if sell_price > buy_price:
+            wins += 1
+        elif sell_price < buy_price:
+            losses += 1
+    return wins, losses
 
 
 @app.get("/traders")
@@ -967,8 +999,7 @@ def get_traders():
         pos_val = sum(p["shares"] * current_prices.get(p["ticker"], p["avg_cost"]) for p in trader_positions)
         pnl = (cash + pos_val) - STARTING_CASH
 
-        wins = sum(1 for p in trader_positions if current_prices.get(p["ticker"], p["avg_cost"]) > p["avg_cost"])
-        losses = sum(1 for p in trader_positions if current_prices.get(p["ticker"], p["avg_cost"]) < p["avg_cost"])
+        wins, losses = get_trader_wl(trader_id)
 
         trade_count_res = (
             supabase.table("trades")
@@ -1372,7 +1403,7 @@ def chat_with_trader(trader_id: str, body: ChatRequest):
 
     msg = _anthropic_client.messages.create(
         model="claude-haiku-4-5-20251001",
-        max_tokens=256,
+        max_tokens=350,
         system=system,
         messages=messages,
     )
