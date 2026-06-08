@@ -342,7 +342,7 @@ export default function Home() {
           label="Best Performer"
           value={
             summary?.best_performer
-              ? `${TRADER_META[summary.best_performer]?.name}  +${summary.best_performer_pnl?.toLocaleString('en-US', { maximumFractionDigits: 0 })}`
+              ? `${TRADER_META[summary.best_performer]?.name}  ${(summary.best_performer_pnl ?? 0) >= 0 ? '+' : ''}${summary.best_performer_pnl?.toLocaleString('en-US', { maximumFractionDigits: 0 })}`
               : '—'
           }
           accent={summary?.best_performer ? TRADER_META[summary.best_performer]?.color : undefined}
