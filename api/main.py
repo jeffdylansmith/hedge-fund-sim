@@ -17,6 +17,7 @@ import resend
 import pytz
 import logging
 import os
+import threading
 import yfinance as yf
 from ingestion.discover_tickers import CORE_TICKERS
 
@@ -95,6 +96,7 @@ STARTING_CASH = 333_333.33
 TRADER_IDS = ["alex", "jordan", "casey"]
 ET = pytz.timezone("America/New_York")
 _last_reconcile_summary: dict = {}
+_run_in_progress: bool = False
 
 resend.api_key = os.getenv("RESEND_API_KEY", "")
 ALERT_EMAIL = os.getenv("ALERT_EMAIL_ADDRESS", "")
@@ -704,6 +706,7 @@ def scheduler_status():
         "running": scheduler.running,
         "paused": _is_paused(),
         "market_open": is_market_hours(),
+        "run_in_progress": _run_in_progress,
         "next_runs": [t.isoformat() for t in next_runs],
     }
 
@@ -738,18 +741,30 @@ def unpause_scheduler():
 
 @app.post("/run")
 def run_now():
+    global _run_in_progress
+    if _run_in_progress:
+        return {"status": "already_running"}
+
     ran_at = datetime.now(timezone.utc).isoformat()
     log.info("run: manual trigger via POST /run")
-    try:
-        from agents.graph import run_all_traders
-        run_all_traders()
-        _log_run("success")
-        return {"ran_at": ran_at, "status": "ok", "errors": []}
-    except Exception as e:
-        error = str(e)
-        log.error(f"run: failed — {error}")
-        _log_run("error", error[:500])
-        raise HTTPException(status_code=500, detail=error)
+
+    def _worker():
+        global _run_in_progress
+        try:
+            from agents.graph import run_all_traders
+            run_all_traders()
+            _log_run("success")
+            log.info("run: manual run complete")
+        except Exception as e:
+            error = str(e)
+            log.error(f"run: failed — {error}")
+            _log_run("error", error[:500])
+        finally:
+            _run_in_progress = False
+
+    _run_in_progress = True
+    threading.Thread(target=_worker, daemon=True).start()
+    return {"status": "started", "ran_at": ran_at}
 
 
 # ---------------------------------------------------------------------------
