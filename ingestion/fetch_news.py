@@ -3,6 +3,7 @@ from dotenv import load_dotenv
 from datetime import datetime, timezone, timedelta
 from utils.db import supabase
 import os
+import yfinance as yf
 
 load_dotenv()
 
@@ -16,21 +17,25 @@ _SPAM_PHRASES = [
     "Rosen Law",
 ]
 
-TICKER_NAMES = {
-    "AAPL":  ["Apple", "AAPL"],
-    "MSFT":  ["Microsoft", "MSFT"],
-    "GOOGL": ["Google", "Alphabet", "GOOGL"],
-    "TSLA":  ["Tesla", "TSLA"],
-    "JPM":   ["JPMorgan", "JP Morgan", "JPM"],
-    "XOM":   ["Exxon", "ExxonMobil", "XOM"],
-    "JNJ":   ["Johnson & Johnson", "J&J", "JNJ"],
-    "SPY":   ["S&P 500", "SPY", "ETF"],
-    "DELL":  ["Dell", "DELL"],
-    "NTAP":  ["NetApp", "NTAP"],
-    "OKTA":  ["Okta", "OKTA"],
-    "HPE":   ["Hewlett Packard", "HPE"],
-    "SMCI":  ["Super Micro", "SuperMicro", "SMCI"],
-}
+_ticker_names_cache: dict = {}
+
+
+def get_ticker_names() -> dict:
+    global _ticker_names_cache
+    if _ticker_names_cache:
+        return _ticker_names_cache
+    rows = supabase.table("watchlist").select("ticker").execute()
+    result = {}
+    for row in rows.data:
+        ticker = row["ticker"]
+        try:
+            info = yf.Ticker(ticker).info
+            name = info.get("shortName") or info.get("longName") or ticker
+        except Exception:
+            name = ticker
+        result[ticker] = [name, ticker]
+    _ticker_names_cache = result
+    return result
 
 
 def _is_spam(headline: str) -> bool:
@@ -39,7 +44,7 @@ def _is_spam(headline: str) -> bool:
 
 
 def _is_relevant(ticker: str, headline: str, description: str) -> bool:
-    terms = TICKER_NAMES.get(ticker, [ticker])
+    terms = get_ticker_names().get(ticker, [ticker])
     text = f"{headline} {description or ''}".lower()
     return any(term.lower() in text for term in terms)
 
