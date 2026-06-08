@@ -18,6 +18,7 @@ import pytz
 import logging
 import os
 import yfinance as yf
+from ingestion.discover_tickers import CORE_TICKERS
 
 load_dotenv()
 
@@ -31,6 +32,15 @@ async def lifespan(app: FastAPI):
         "scheduler: started — discovery 09:00, trader runs 08:30–16:00, "
         "EOD flatten 15:45, EOD summary 16:05, reconcile every 30min ET"
     )
+    try:
+        for ticker in CORE_TICKERS:
+            supabase.table("watchlist").upsert(
+                {"ticker": ticker},
+                on_conflict="ticker",
+            ).execute()
+        log.info(f"startup: ensured {len(CORE_TICKERS)} core tickers in watchlist")
+    except Exception as e:
+        log.warning(f"startup: core ticker upsert failed: {e}")
     send_alert(
         subject="Meridian Capital — App Started",
         body=(

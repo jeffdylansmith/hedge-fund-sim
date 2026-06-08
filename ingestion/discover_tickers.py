@@ -2,6 +2,11 @@ import yfinance as yf
 from datetime import datetime, timezone, timedelta
 from utils.db import supabase
 
+CORE_TICKERS = {
+    "AAPL", "MSFT", "GOOGL", "TSLA", "SPY",
+    "NVDA", "JPM", "AMZN", "QQQ",
+}
+
 
 def run_discovery():
     try:
@@ -87,6 +92,29 @@ def run_discovery():
             except Exception as e:
                 print(f"  discover: price bootstrap failed for {ticker}: {e}")
 
+        # 6.5. CAP watchlist at 25 tickers — evict oldest with no open positions
+        current_wl = supabase.table("watchlist").select("ticker, added_at").execute()
+        current_count = len(current_wl.data)
+        removed_count = 0
+
+        if current_count + len(top5) > 25:
+            open_pos = supabase.table("portfolio_positions").select("ticker").execute()
+            held = {r["ticker"] for r in open_pos.data}
+            evictable = sorted(
+                [
+                    r for r in current_wl.data
+                    if r["ticker"] not in held and r["ticker"] not in CORE_TICKERS
+                ],
+                key=lambda r: r.get("added_at") or "",
+            )
+            slots_needed = current_count + len(top5) - 25
+            for r in evictable[:slots_needed]:
+                try:
+                    supabase.table("watchlist").delete().eq("ticker", r["ticker"]).execute()
+                    removed_count += 1
+                except Exception as e:
+                    print(f"  discover: watchlist evict failed for {r['ticker']}: {e}")
+
         # 7. ADD to watchlist and discovered_opportunities
         expires_at = (now + timedelta(days=14)).isoformat()
         for ticker, data in top5:
@@ -122,6 +150,10 @@ def run_discovery():
             f"passed_filter={len(filtered)} "
             f"net_new={len(top5)} "
             f"added={[t for t, _ in top5]}"
+        )
+        print(
+            f"discovery: watchlist at {current_count + len(top5) - removed_count} tickers, "
+            f"removed {removed_count}, added {len(top5)}"
         )
 
     except Exception as e:

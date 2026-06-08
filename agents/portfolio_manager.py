@@ -112,6 +112,76 @@ _TRADER_INSTRUCTIONS = {
 }
 
 
+def _decide_batch(
+    batch: list,
+    system: str,
+    prices_by_ticker: dict,
+    news_summary: dict,
+    tech_signals: dict,
+    fundamental_scores: dict,
+    positions_by_ticker: dict,
+    sizing_rules: str,
+    cash: float,
+    decided_so_far: list,
+) -> list:
+    prices_text = "\n".join(
+        f"  {t}: ${prices_by_ticker[t]:.2f}"
+        for t in batch
+        if t in prices_by_ticker
+    )
+    positions_text = (
+        "\n".join(
+            f"  {t}: {positions_by_ticker[t]['shares']} shares @ avg ${positions_by_ticker[t]['avg_cost']:.2f}"
+            for t in batch
+            if t in positions_by_ticker
+        )
+        or "  No current positions."
+    )
+    prior_context = ""
+    if decided_so_far:
+        prior_lines = []
+        for d in decided_so_far:
+            ticker = d.get("ticker", "?")
+            action = d.get("action", "?")
+            shares = d.get("shares", 0)
+            if action in ("BUY", "SELL"):
+                prior_lines.append(f"{ticker}: {action} {shares} shares")
+            else:
+                prior_lines.append(f"{ticker}: HOLD")
+        prior_context = f"\nDecisions already made this run: {', '.join(prior_lines)}\n"
+
+    user_content = f"""News Summary:
+{json.dumps(news_summary, indent=2)}
+
+Technical Signals:
+{json.dumps(tech_signals, indent=2)}
+
+Current Positions:
+{positions_text}
+
+Current Prices:
+{prices_text}
+
+Available Cash: ${cash:,.2f}
+{prior_context}
+Watchlist: {', '.join(batch)}
+
+Return a JSON array with one decision object per ticker in the watchlist."""
+
+    raw = _call_llm(system, user_content, max_tokens=1500).strip()
+
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        pass
+
+    clean = re.sub(r"^```json\s*|^```\s*|```$", "", raw, flags=re.MULTILINE).strip()
+    try:
+        return json.loads(clean)
+    except json.JSONDecodeError:
+        return []
+
+
 def decide_portfolio(
     news_summary: dict,
     tech_signals: dict,
@@ -138,43 +208,32 @@ def decide_portfolio(
     if trader_memory:
         system = system.rstrip() + f"\n\nYOUR PERFORMANCE MEMORY:\n{trader_memory}\n"
 
-    positions_text = (
-        "\n".join(
-            f"  {p['ticker']}: {p['shares']} shares @ avg ${p['avg_cost']:.2f}"
-            for p in positions
-        )
-        or "  No current positions."
-    )
-    prices_text = "\n".join(f"  {t}: ${p:.2f}" for t, p in current_prices.items())
-
-    user_content = f"""News Summary:
-{json.dumps(news_summary, indent=2)}
-
-Technical Signals:
-{json.dumps(tech_signals, indent=2)}
-
-Current Positions:
-{positions_text}
-
-Current Prices:
-{prices_text}
-
-Available Cash: ${cash:,.2f}
-
-Watchlist: {', '.join(watchlist)}
-
-Return a JSON array with one decision object per ticker in the watchlist."""
-
     effective_system = f"{trader_persona}\n\n{system}" if trader_persona else system
+    positions_by_ticker = {p["ticker"]: p for p in positions}
 
-    raw = _call_llm(effective_system, user_content, max_tokens=1024).strip()
+    decided_so_far = []
+    errors = []
 
-    # Attempt 1: parse raw response
-    try:
-        return json.loads(raw)
-    except json.JSONDecodeError:
-        pass
+    for i in range(0, len(watchlist), 10):
+        batch = watchlist[i : i + 10]
+        try:
+            batch_decisions = _decide_batch(
+                batch=batch,
+                system=effective_system,
+                prices_by_ticker=current_prices,
+                news_summary=news_summary,
+                tech_signals=tech_signals,
+                fundamental_scores={},
+                positions_by_ticker=positions_by_ticker,
+                sizing_rules=sizing_rules,
+                cash=cash,
+                decided_so_far=decided_so_far,
+            )
+            decided_so_far.extend(batch_decisions)
+        except Exception as e:
+            errors.append(f"batch {batch}: {e}")
 
-    # Attempt 2: strip markdown fences and retry
-    clean = re.sub(r"^```json\s*|^```\s*|```$", "", raw, flags=re.MULTILINE).strip()
-    return json.loads(clean)
+    if errors:
+        print(f"portfolio_manager: batch errors: {errors}")
+
+    return decided_so_far
