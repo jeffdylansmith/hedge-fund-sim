@@ -11,7 +11,7 @@ from alpaca.trading.requests import MarketOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce
 from supabase import create_client
 from dotenv import load_dotenv
-from datetime import datetime, date, time, timezone
+from datetime import datetime, date, time, timedelta, timezone
 import anthropic
 import resend
 import pytz
@@ -165,6 +165,42 @@ def check_fund_health() -> None:
                 f"Log in to review: https://hedge-fund-sim.vercel.app"
             ),
         )
+
+
+def snapshot_portfolio_value() -> float:
+    try:
+        positions = supabase.table("portfolio_positions").select("*").execute()
+        balances = supabase.table("fund_balance").select("trader_id, cash").execute()
+        balance_map = {r["trader_id"]: float(r["cash"]) for r in balances.data}
+
+        tickers = list({p["ticker"] for p in positions.data})
+        price_map = get_latest_prices(tickers)
+
+        trader_values = {}
+        for trader_id in TRADER_IDS:
+            cash = balance_map.get(trader_id, STARTING_CASH)
+            pos_val = sum(
+                float(p["shares"]) * price_map.get(p["ticker"], float(p["avg_cost"]))
+                for p in positions.data
+                if p["trader_id"] == trader_id
+            )
+            trader_values[trader_id] = cash + pos_val
+
+        total = sum(trader_values.values())
+
+        supabase.table("portfolio_value_history").insert({
+            "recorded_at":  datetime.now(timezone.utc).isoformat(),
+            "total_value":  round(total, 2),
+            "alex_value":   round(trader_values.get("alex", 0.0), 2),
+            "jordan_value": round(trader_values.get("jordan", 0.0), 2),
+            "casey_value":  round(trader_values.get("casey", 0.0), 2),
+        }).execute()
+
+        log.info(f"NAV snapshot: ${total:,.2f}")
+        return total
+    except Exception as e:
+        log.warning(f"NAV snapshot failed: {e}")
+        return 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -390,6 +426,7 @@ def flatten_all_positions() -> None:
         f"EOD flatten: closed {closed} positions via RPC, "
         f"{records_written} trade records written, {failures} failures"
     )
+    snapshot_portfolio_value()
 
 
 def generate_daily_summaries() -> None:
@@ -753,6 +790,7 @@ def run_now():
         try:
             from agents.graph import run_all_traders
             run_all_traders()
+            snapshot_portfolio_value()
             _log_run("success")
             log.info("run: manual run complete")
         except Exception as e:
@@ -895,6 +933,19 @@ def get_fund_summary():
         "best_performer": best_trader,
         "best_performer_pnl": round(best_pnl, 2) if best_pnl is not None else 0.0,
     }
+
+
+@app.get("/fund/history")
+def get_fund_history(days: int = Query(default=7, ge=1, le=30)):
+    since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    result = (
+        supabase.table("portfolio_value_history")
+        .select("recorded_at, total_value, alex_value, jordan_value, casey_value")
+        .gte("recorded_at", since)
+        .order("recorded_at", desc=False)
+        .execute()
+    )
+    return result.data
 
 
 @app.get("/traders")

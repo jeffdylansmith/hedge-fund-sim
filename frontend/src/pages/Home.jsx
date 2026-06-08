@@ -256,11 +256,12 @@ function StatCard({ label, value, accent }) {
 // ── Page ──────────────────────────────────────────────────────────────────────
 
 export default function Home() {
-  const [summary,   setSummary]   = useState(null)
-  const [traders,   setTraders]   = useState([])
-  const [feed,      setFeed]      = useState([])
-  const [sparkData, setSparkData] = useState([])
-  const [filters,   setFilters]   = useState({
+  const [summary,     setSummary]     = useState(null)
+  const [traders,     setTraders]     = useState([])
+  const [feed,        setFeed]        = useState([])
+  const [sparkData,   setSparkData]   = useState([])
+  const [historyData, setHistoryData] = useState([])
+  const [filters,     setFilters]     = useState({
     trades:     true,
     reactions:  true,
     summaries:  true,
@@ -272,21 +273,38 @@ export default function Home() {
     setFilters(f => ({ ...f, [key]: !f[key] }))
   }
 
+  function applyHistory(h, fallbackValue) {
+    if (h.length >= 2) {
+      setHistoryData(h)
+      setSparkData(h.map(p => ({
+        date: new Date(p.recorded_at).toLocaleDateString('en-US', { month: 'short', day: 'numeric' }),
+        value: p.total_value,
+      })))
+    } else if (fallbackValue != null) {
+      setSparkData(buildSparkline(fallbackValue))
+    }
+  }
+
   async function fetchFeed() {
-    const f = await fetch(`${API}/feed?limit=20`).then(r => r.json())
+    const [f, h] = await Promise.all([
+      fetch(`${API}/feed?limit=20`).then(r => r.json()),
+      fetch(`${API}/fund/history?days=7`).then(r => r.json()),
+    ])
     setFeed(f)
+    applyHistory(h, null)
   }
 
   async function fetchAll() {
-    const [s, t, f] = await Promise.all([
+    const [s, t, f, h] = await Promise.all([
       fetch(`${API}/fund/summary`).then(r => r.json()),
       fetch(`${API}/traders`).then(r => r.json()),
       fetch(`${API}/feed?limit=20`).then(r => r.json()),
+      fetch(`${API}/fund/history?days=7`).then(r => r.json()),
     ])
     setSummary(s)
     setTraders(t)
     setFeed(f)
-    setSparkData(buildSparkline(s.total_fund_value))
+    applyHistory(h, s.total_fund_value)
   }
 
   useEffect(() => {
@@ -297,7 +315,9 @@ export default function Home() {
 
   const sorted = [...traders].sort((a, b) => b.pnl - a.pnl)
   const maxPnl = sorted.length ? Math.max(...sorted.map(t => Math.abs(t.pnl)), 1) : 1
-  const gain   = summary ? summary.total_fund_value - 1_000_000 : 0
+  const gain   = historyData.length >= 2
+    ? historyData[historyData.length - 1].total_value - historyData[0].total_value
+    : summary ? summary.total_fund_value - 1_000_000 : 0
 
   const parsedFeed  = feed.map(parseFeedItem)
   const visibleFeed = parsedFeed.filter(item => filters[getFilterGroup(item.parsedAction)])
