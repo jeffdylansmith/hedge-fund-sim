@@ -13,6 +13,7 @@ from supabase import create_client
 from dotenv import load_dotenv
 from datetime import datetime, date, time, timedelta, timezone
 import anthropic
+import json
 import resend
 import pytz
 import logging
@@ -20,6 +21,7 @@ import os
 import threading
 import yfinance as yf
 from ingestion.discover_tickers import CORE_TICKERS
+from scripts.audit_fund import run_audit as _run_audit
 
 load_dotenv()
 
@@ -31,7 +33,7 @@ async def lifespan(app: FastAPI):
     scheduler.start()
     log.info(
         "scheduler: started — discovery 09:00, trader runs 08:30–16:00, "
-        "EOD flatten 15:45, EOD summary 16:05, reconcile every 30min ET"
+        "EOD flatten 15:45, EOD summary 16:05, reconcile+audit every 30min ET"
     )
     try:
         for ticker in CORE_TICKERS:
@@ -96,7 +98,10 @@ STARTING_CASH = 333_333.33
 TRADER_IDS = ["alex", "jordan", "casey"]
 ET = pytz.timezone("America/New_York")
 _last_reconcile_summary: dict = {}
+_last_audit_summary: dict = {}
 _run_in_progress: bool = False
+
+AUDIT_ALERT_THRESHOLD = 800_000  # email only if fund drops below this
 
 resend.api_key = os.getenv("RESEND_API_KEY", "")
 ALERT_EMAIL = os.getenv("ALERT_EMAIL_ADDRESS", "")
@@ -706,6 +711,29 @@ def reconcile_positions() -> dict:
     return _last_reconcile_summary
 
 
+def run_audit_job() -> None:
+    global _last_audit_summary
+    try:
+        summary = _run_audit(db=supabase)
+        _last_audit_summary = summary
+
+        if not summary["fund_sanity_ok"] and summary["fund_total"] < AUDIT_ALERT_THRESHOLD:
+            send_alert(
+                subject="🚨 Meridian Capital — Fund Integrity Alert",
+                body=(
+                    f"Fund total has dropped below ${AUDIT_ALERT_THRESHOLD:,.0f}.\n\n"
+                    f"Current fund total (at avg_cost): ${summary['fund_total']:,.2f}\n"
+                    f"Cash corrections applied: {summary['cash_corrections']}\n"
+                    f"Position corrections applied: {summary['position_corrections']}\n"
+                    f"Audit ran at: {summary['ran_at']}\n\n"
+                    f"This requires human review. "
+                    f"Log in at: https://hedge-fund-sim.vercel.app"
+                ),
+            )
+    except Exception as e:
+        log.error(f"audit job failed: {e}")
+
+
 # Hourly on the :30 mark — is_market_hours() gates actual execution (8:30am–4pm ET, no holidays)
 scheduler.add_job(
     run_market_session,
@@ -726,6 +754,9 @@ scheduler.add_job(generate_daily_summaries, CronTrigger(hour=16, minute=5, day_o
 
 # Every 30 minutes 24/7 — reconcile Alpaca vs DB (no market-hours or pause gate)
 scheduler.add_job(reconcile_positions, IntervalTrigger(minutes=30))
+
+# Every 30 minutes 24/7 — audit fund integrity and auto-correct drift
+scheduler.add_job(run_audit_job, IntervalTrigger(minutes=30))
 
 
 # ---------------------------------------------------------------------------
@@ -949,37 +980,33 @@ def get_fund_history(days: int = Query(default=7, ge=1, le=30)):
     return result.data
 
 
-# N+1 queries (one per sell per trader) — acceptable for now; optimize with a join later if needed
 def get_trader_wl(trader_id: str) -> tuple:
-    sells = (
+    # 1 query total instead of 1 + len(sells)
+    all_trades = (
         supabase.table("trades")
-        .select("ticker, price, shares, executed_at")
+        .select("ticker, action, price, executed_at")
         .eq("trader_id", trader_id)
-        .eq("action", "sell")
-        .order("executed_at", desc=False)
+        .order("executed_at")
         .execute()
     )
+    # group all buys by ticker so we can look them up per sell in O(1)
+    buys_by_ticker: dict[str, list] = {}
+    for t in all_trades.data:
+        if t["action"] == "buy":
+            buys_by_ticker.setdefault(t["ticker"], []).append(t)
+
     wins = losses = 0
-    for sell in sells.data:
-        buy = (
-            supabase.table("trades")
-            .select("price")
-            .eq("trader_id", trader_id)
-            .eq("ticker", sell["ticker"])
-            .eq("action", "buy")
-            .lt("executed_at", sell["executed_at"])
-            .order("executed_at", desc=True)
-            .limit(1)
-            .execute()
-        )
-        if not buy.data:
+    for t in all_trades.data:
+        if t["action"] != "sell":
             continue
-        sell_price = float(sell["price"])
-        buy_price = float(buy.data[0]["price"])
-        if sell_price > buy_price:
-            wins += 1
-        elif sell_price < buy_price:
-            losses += 1
+        prior_buys = [b for b in buys_by_ticker.get(t["ticker"], [])
+                      if b["executed_at"] < t["executed_at"]]
+        if not prior_buys:
+            continue
+        buy_price  = float(prior_buys[-1]["price"])   # most recent prior buy
+        sell_price = float(t["price"])
+        if sell_price > buy_price:   wins  += 1
+        elif sell_price < buy_price: losses += 1
     return wins, losses
 
 
@@ -1162,6 +1189,51 @@ def reconciliation_status():
         "last_run": _last_reconcile_summary,
         "recent_corrections": rows.data,
     }
+
+
+@app.post("/audit/run")
+def trigger_audit():
+    global _last_audit_summary
+    log.info("audit: manual trigger via POST /audit/run")
+    try:
+        summary = _run_audit(db=supabase)
+        _last_audit_summary = summary
+
+        if not summary["fund_sanity_ok"] and summary["fund_total"] < AUDIT_ALERT_THRESHOLD:
+            send_alert(
+                subject="🚨 Meridian Capital — Fund Integrity Alert",
+                body=(
+                    f"Fund total has dropped below ${AUDIT_ALERT_THRESHOLD:,.0f}.\n\n"
+                    f"Current fund total (at avg_cost): ${summary['fund_total']:,.2f}\n"
+                    f"Cash corrections applied: {summary['cash_corrections']}\n"
+                    f"Position corrections applied: {summary['position_corrections']}\n"
+                    f"Audit ran at: {summary['ran_at']}\n\n"
+                    f"This requires human review. "
+                    f"Log in at: https://hedge-fund-sim.vercel.app"
+                ),
+            )
+
+        return summary
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/audit/log")
+def get_audit_log(limit: int = Query(default=50, ge=1, le=500)):
+    try:
+        rows = (
+            supabase.table("audit_log")
+            .select("*")
+            .order("checked_at", desc=True)
+            .limit(limit)
+            .execute()
+        )
+        return {
+            "last_run": _last_audit_summary,
+            "entries": rows.data,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"audit_log unavailable: {e}")
 
 
 @app.get("/fundamentals")
