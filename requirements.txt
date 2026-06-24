@@ -152,3 +152,4 @@ widgetsnbextension==4.0.15
 yarl==1.24.2
 yfinance==1.4.0
 zstandard==0.25.0
+scipy==1.17.1
