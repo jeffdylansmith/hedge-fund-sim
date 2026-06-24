@@ -9,4 +9,4 @@ __pycache__/
 dist/
 .pytest_cache/
 .claude/
-requirements_full.txt
+requirements_full.txtSTUDY_GUIDE.md
