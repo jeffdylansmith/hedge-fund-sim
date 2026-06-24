@@ -77,6 +77,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+from api.options_routes import router as options_router
+app.include_router(options_router)
+
 supabase = create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_KEY"))
 
 _alpaca_key = os.getenv("ALPACA_API_KEY")
