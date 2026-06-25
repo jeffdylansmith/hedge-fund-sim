@@ -231,6 +231,23 @@ def run_position_monitor() -> dict:
                 close_reasons[reason] = close_reasons.get(reason, 0) + 1
                 print(f"[position_monitor] Closed {ticker} {strategy} — {reason} "
                       f"P&L: ${unrealized_pnl:,.2f}")
+
+                # Synthesize episode for RAG
+                try:
+                    from agents.options.episode_synthesizer import synthesize_episode
+                    closed_position = {**position,
+                                       "realized_pnl": unrealized_pnl,
+                                       "close_reason": reason,
+                                       "closed_at": datetime.utcnow().isoformat()}
+                    synthesis = synthesize_episode(closed_position)
+                    if synthesis["success"]:
+                        print(f"[position_monitor] Episode synthesized "
+                              f"(doc_id: {synthesis['document_id']})")
+                    else:
+                        print(f"[position_monitor] Episode synthesis failed: "
+                              f"{synthesis.get('error')}")
+                except Exception as e:
+                    errors.append(f"synthesis for {position_id}: {str(e)}")
             else:
                 _update_unrealized_pnl(position_id, unrealized_pnl)
 

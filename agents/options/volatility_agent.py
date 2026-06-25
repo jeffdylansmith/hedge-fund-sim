@@ -213,6 +213,20 @@ def _generate_rationale(
     """
     earnings_str = f"Earnings in {earnings_proximity} days." if earnings_proximity else "No imminent earnings."
 
+    # Retrieve relevant historical episodes
+    historical_context = ""
+    try:
+        from utils.retrieval import retrieve_and_format
+        query = (f"{ticker} options volatility {iv_environment} IV "
+                 f"{recommendation} environment")
+        historical_context = retrieve_and_format(
+            query=query,
+            ticker=ticker,
+            top_k=3,
+        )
+    except Exception:
+        pass  # retrieval failure never blocks the agent
+
     prompt = f"""You are a volatility analyst. Write exactly one sentence (max 30 words)
 explaining this IV assessment for {ticker}.
 
@@ -222,6 +236,7 @@ IV Percentile: {iv_percentile:.0f}th percentile
 Environment: {iv_environment}
 Recommendation: {recommendation}
 {earnings_str}
+{historical_context if historical_context else ""}
 
 One sentence only. Be specific about the numbers. No preamble."""
 

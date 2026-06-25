@@ -30,6 +30,21 @@ def _build_thesis_prompt(
     Builds the prompt for thesis generation.
     Kept as a separate function so it can be tested independently.
     """
+    # Retrieve relevant historical episodes for this ticker
+    historical_context = ""
+    try:
+        from utils.retrieval import retrieve_and_format
+        direction_hint = news_summary.get("sentiment", "neutral")
+        query = (f"{ticker} options trade {direction_hint} sentiment "
+                 f"{tech_signals.get('trend', '')} trend")
+        historical_context = retrieve_and_format(
+            query=query,
+            ticker=ticker,
+            top_k=3,
+        )
+    except Exception:
+        pass
+
     return f"""You are an options thesis analyst for trader {trader_config.name}.
 
 Analyze these signals for {ticker} and produce a structured trading thesis.
@@ -43,6 +58,8 @@ RSI: {tech_signals.get('rsi', 50)}
 MACD: {tech_signals.get('macd', 0)}
 Trend: {tech_signals.get('trend', 'sideways')}
 Signals: {tech_signals.get('signals', [])}
+
+{f"RELEVANT HISTORICAL EPISODES:{chr(10)}{historical_context}" if historical_context else ""}
 
 TRADER PROFILE:
 Risk tolerance: {trader_config.risk_tolerance}
